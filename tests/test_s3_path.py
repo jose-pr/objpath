@@ -31,8 +31,8 @@ class _OtherBackend(BaseS3Backend):
         raise AssertionError("a path that is only built asks for no client")
 
 
-def test_s3path_is_a_pathlib_next_path_that_needs_no_uri():
-    from pathlib_next import Path
+def test_s3path_is_a_pathapi_path_that_needs_no_uri():
+    from pathapi import Path
 
     assert isinstance(S3Path("dir/key", bucket="bkt"), Path)
 

@@ -4,7 +4,7 @@ test asserts on the server side is what the SDK sent. Every test that takes
 `az_server` runs for both classes."""
 
 import pytest
-from pathlib_next.testing import PathContract
+from pathapi.testing import PathContract
 
 pytest.importorskip("azure.storage.blob")
 
@@ -113,7 +113,7 @@ def test_az_blob_that_is_also_a_prefix_lists_as_the_blob(az_server):
 
 
 def test_az_prefix_with_a_hidden_subtree_is_not_copied_moved_or_removed(az_server):
-    from pathlib_next.mempath import MemPath
+    from pathapi.mempath import MemPath
 
     path, _ = az_server
     base = _blob_that_is_also_a_prefix(path)
@@ -313,7 +313,7 @@ def test_az_checksum_of_a_blob_without_a_content_md5_is_refused(
 
 
 def test_az_syncing_an_unchanged_tree_downloads_no_blob(az_server, az_api_server):
-    from pathlib_next.sync import PathSyncer
+    from pathapi.sync import PathSyncer
 
     path, _ = az_server
     state = az_api_server.state

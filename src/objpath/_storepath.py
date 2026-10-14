@@ -9,8 +9,8 @@ import stat as _stat
 import typing as _ty
 import urllib.parse as _urlparse
 
-from pathlib_next import FileStat, Path, Pathname
-from pathlib_next.providers import TreePath, check_follow, copy_error_predicate
+from pathapi import FileStat, Path, Pathname
+from pathapi.providers import TreePath, check_follow, copy_error_predicate
 
 from ._keys import (
     checked_copy,

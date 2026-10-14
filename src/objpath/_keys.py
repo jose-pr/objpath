@@ -13,7 +13,7 @@ import errno as _errno
 import threading as _threading
 import typing as _ty
 
-from pathlib_next import providers as _providers
+from pathapi import providers as _providers
 
 from .exceptions import UnreachableKeysError
 

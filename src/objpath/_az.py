@@ -6,8 +6,8 @@ import itertools as _itertools
 import time as _time
 import typing as _ty
 
-from pathlib_next import FileStat
-from pathlib_next import providers as _providers
+from pathapi import FileStat
+from pathapi import providers as _providers
 
 from . import _failures
 from ._az_backend import (

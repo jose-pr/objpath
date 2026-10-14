@@ -4,7 +4,7 @@
 `S3Path("reports/2026.csv", bucket="data")` has the method names, signatures and
 exception types of `pathlib.Path`; `GSPath` and `AZPath` do the same for the other two
 stores. None needs a URI, and all build on
-[`pathlib-next`](https://jose-pr.github.io/pathlib-next/) alone, which holds the `Path`
+[`pathapi`](https://jose-pr.github.io/pathapi/) alone, which holds the `Path`
 base class, `glob`, `walk` and `PathSyncer`. With
 [`uripath`](https://jose-pr.github.io/uripath/) installed the same package also provides
 the `s3:`, `gs:` and `az:` schemes: `URIPath("s3://data/reports/2026.csv")`.

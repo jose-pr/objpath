@@ -1,10 +1,10 @@
 # Object-store paths
 
-`S3Path`, `GSPath` and `AZPath` are `pathlib_next.Path` classes for the objects of an
+`S3Path`, `GSPath` and `AZPath` are `pathapi.Path` classes for the objects of an
 Amazon S3 bucket, a Google Cloud Storage bucket and an Azure Blob Storage container. They
 support what `pathlib.Path` does on a file system (`open`, `read_text`, `write_bytes`,
 `iterdir`, `glob`, `stat`, `mkdir`, `unlink`, `rmdir`, `rename`, ...) and what
-`pathlib-next` adds (`walk`, `copy`, `move`, `rm`, `PathSyncer`).
+`pathapi` adds (`walk`, `copy`, `move`, `rm`, `PathSyncer`).
 
 ## Naming the bucket
 

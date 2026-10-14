@@ -12,7 +12,7 @@ import pytest
 uripath = pytest.importorskip("uripath")
 pytest.importorskip("objpath.uri")
 
-from pathlib_next.mempath import MemPath  # noqa: E402
+from pathapi.mempath import MemPath  # noqa: E402
 
 from objpath import BaseGSBackend, GSBackend, GSPath, _gs_backend  # noqa: E402
 from objpath.uri import GSURIPath  # noqa: E402

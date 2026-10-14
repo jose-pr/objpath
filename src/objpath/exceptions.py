@@ -10,7 +10,7 @@ never raised across the API. A bad argument is a plain `ValueError` or
 
 from __future__ import annotations
 
-from pathlib_next import PathError
+from pathapi import PathError
 
 __all__ = ["ObjPathError", "ObjectChangedError", "UnreachableKeysError"]
 

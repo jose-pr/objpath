@@ -4,8 +4,8 @@ import errno as _errno
 import io as _io
 import typing as _ty
 
-from pathlib_next import FileStat
-from pathlib_next import providers as _providers
+from pathapi import FileStat
+from pathapi import providers as _providers
 
 from . import _failures
 from ._gs_backend import UNSET, BaseGSBackend, GSBackend, _default_backend

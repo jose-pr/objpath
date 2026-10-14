@@ -44,7 +44,7 @@ def mutant(
     MUTANTS.append(Mutant(id, file, old, new, tuple(tests), note, platform))
 
 
-# --- carried from the object-store schemes of pathlib-next ---------------------
+# --- carried from the object-store schemes of pathapi ---------------------
 mutant(
     "s3-exclusive-create-store-error",
     "_s3.py",
@@ -416,4 +416,21 @@ mutant(
     "class ObjectChangedError(ObjPathError):\n",
     "tests/test_az.py::test_az_a_read_across_an_overwrite_raises_and_returns_no_mixed_bytes",
     "a stream whose object changed raises something that is not an OSError",
+)
+
+mutant(
+    "unclosed-spool-is-uploaded-at-collection",
+    "_writer.py",
+    "        return self._dirty and not self._dropped\n",
+    "        return False\n",
+    "tests/test_spool_unclosed.py::test_an_unclosed_written_stream_is_discarded_at_collection",
+    "a spooled stream that the collector finalizes unclosed uploads what it holds",
+)
+mutant(
+    "unmodified-spool-warns-at-collection",
+    "_writer.py",
+    "        return self._dirty and not self._dropped\n",
+    "        return True\n",
+    "tests/test_spool_unclosed.py::test_an_unclosed_stream_that_was_not_modified_is_collected_silently",
+    "a spooled stream with nothing to upload warns when collected",
 )

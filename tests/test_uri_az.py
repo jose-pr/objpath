@@ -16,7 +16,7 @@ pytest.importorskip("uripath")
 pytest.importorskip("objpath.uri")
 pytest.importorskip("azure.storage.blob")
 
-from pathlib_next.mempath import MemPath
+from pathapi.mempath import MemPath
 from uripath import URIPath
 
 from objpath import AZBackend, AZPath, BaseAZBackend

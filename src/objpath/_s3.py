@@ -6,8 +6,8 @@ import itertools as _itertools
 import re as _re
 import typing as _ty
 
-from pathlib_next import FileStat
-from pathlib_next import providers as _providers
+from pathapi import FileStat
+from pathapi import providers as _providers
 
 from ._s3_backend import BaseS3Backend, S3Backend, _default_backend
 from ._s3_errors import (

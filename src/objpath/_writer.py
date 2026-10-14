@@ -5,7 +5,7 @@ from __future__ import annotations
 import io as _io
 import tempfile as _tempfile
 
-from pathlib_next import providers as _providers
+from pathapi import providers as _providers
 
 SPOOL_SIZE = 4 * 1024**2
 """Bytes a write stream keeps in memory before spilling to a temp file, and
@@ -24,6 +24,7 @@ class SpoolUploadStream(_providers.DiscardOnError, _io.BufferedIOBase):
     #: Bytes kept in memory before the spool moves to a temp file.
     spool_size = SPOOL_SIZE
     _dropped = False
+    _dirty = False
 
     def __init__(self, path, exclusive=False, initial=None):
         super().__init__()
@@ -80,9 +81,13 @@ class SpoolUploadStream(_providers.DiscardOnError, _io.BufferedIOBase):
             size = self._file.tell()
         return self._file.truncate(size)
 
+    def _holds_uncommitted(self):
+        return self._dirty and not self._dropped
+
     def discard(self):
         """Drop the spool: `close()` uploads nothing. `open()` calls it when
-        the `with` block over the stream raised."""
+        the `with` block over the stream raised, and the collector when the
+        stream is finalized unclosed."""
         self._dropped = True
         self._file.close()
 

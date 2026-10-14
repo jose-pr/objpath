@@ -14,7 +14,7 @@ never `uripath`: `S3Path`, `GSPath`, `AZPath` and the backends are loaded the
 first time they are named, and a store's SDK is imported when its client is
 built.
 
-Install with `pip install objpath`, which needs only `pathlib-next`. One extra
+Install with `pip install objpath`, which needs only `pathapi`. One extra
 per store brings its SDK, and a store used without its extra raises an
 `ImportError` that names it:
 
@@ -48,7 +48,7 @@ class AZPath(Path):
     ): ...
 ```
 
-`S3Path`, `GSPath` and `AZPath` are `pathlib_next.Path` classes (so
+`S3Path`, `GSPath` and `AZPath` are `pathapi.Path` classes (so
 `pathlib.Path`'s methods, `copy()`, `move()`, `rm()`, `walk()`, `glob()` and
 `PathSyncer` work on them) over an Amazon S3 bucket, a Google Cloud Storage
 bucket and an Azure Blob Storage container. They need no URI. `segments` are the
@@ -276,7 +276,7 @@ default backend of the process (`s3:`, `gs:`) or of the account in the authority
 ## Exceptions (`objpath.exceptions`)
 
 ```python
-class ObjPathError(pathlib_next.PathError): ...
+class ObjPathError(pathapi.PathError): ...
 class ObjectChangedError(ObjPathError, OSError): ...
 class UnreachableKeysError(ObjPathError, OSError): ...
 ```

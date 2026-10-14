@@ -6,7 +6,7 @@ from __future__ import annotations
 import threading as _threading
 import urllib.parse as _urlparse
 
-from pathlib_next import providers as _providers
+from pathapi import providers as _providers
 
 from ._clients import ClientBackend, LazyClientBackend
 from ._optional import import_client

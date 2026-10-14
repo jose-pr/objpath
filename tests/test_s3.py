@@ -23,7 +23,7 @@ import botocore.exceptions as _botoexc
 
 from objpath import BaseS3Backend, S3Backend
 from objpath.exceptions import UnreachableKeysError
-from pathlib_next.testing import PathContract
+from pathapi.testing import PathContract
 from store_support import make_path
 
 # boto3 announces the end of its Python 3.9 support when it creates its first
@@ -462,7 +462,7 @@ def test_trailing_slash_mkdir_then_rmdir_moto(flavor, moto_s3):
 
 
 def test_key_that_is_object_and_prefix_lists_as_the_object(flavor, moto_s3):
-    from pathlib_next.mempath import MemPath
+    from pathapi.mempath import MemPath
 
     moto_s3.put_object(Bucket="bkt", Key="src/logs", Body=b"FILE-CONTENT")
     moto_s3.put_object(Bucket="bkt", Key="src/logs/2026.txt", Body=b"child")
@@ -577,8 +577,8 @@ def test_walk_of_a_prefix_with_dot_segment_keys_stays_inside_it(flavor, moto_s3)
 def test_sync_remove_missing_leaves_the_neighbours_of_a_dot_segment_key(
     flavor, moto_s3
 ):
-    from pathlib_next.mempath import MemPath
-    from pathlib_next.sync import PathSyncer, SyncEvent
+    from pathapi.mempath import MemPath
+    from pathapi.sync import PathSyncer, SyncEvent
 
     for key in _DOT_KEYS:
         moto_s3.put_object(Bucket="bkt", Key=key, Body=b"x")
@@ -602,8 +602,8 @@ def test_sync_remove_missing_leaves_the_neighbours_of_a_dot_segment_key(
 def test_sync_from_a_prefix_with_dot_segment_keys_copies_only_its_own_tree(
     flavor, moto_s3
 ):
-    from pathlib_next.mempath import MemPath
-    from pathlib_next.sync import PathSyncer, SyncEvent
+    from pathapi.mempath import MemPath
+    from pathapi.sync import PathSyncer, SyncEvent
 
     for key in _DOT_KEYS:
         moto_s3.put_object(Bucket="bkt", Key=key, Body=b"x")
@@ -665,7 +665,7 @@ def test_move_of_a_prefix_with_keys_a_listing_hides_keeps_every_key(
 def test_move_of_such_a_prefix_to_memory_creates_nothing_there(
     flavor, moto_s3, odd_prefix
 ):
-    from pathlib_next.mempath import MemPath
+    from pathapi.mempath import MemPath
 
     target = MemPath("/moved")
     with pytest.raises(UnreachableKeysError):
@@ -1003,7 +1003,7 @@ def test_checksum_of_a_single_part_object_is_its_md5_and_reads_no_byte(flavor, m
 
 
 def test_checksum_refuses_the_etag_of_a_multipart_object(flavor, moto_s3):
-    from pathlib_next import checksum as checksums
+    from pathapi import checksum as checksums
 
     _multipart_object(moto_s3, "big.bin")
     etag = moto_s3.head_object(Bucket="bkt", Key="big.bin")["ETag"]
@@ -1081,7 +1081,7 @@ def test_supported_checksums_asks_the_store_nothing(flavor):
 
 
 def test_syncing_an_unchanged_tree_to_another_prefix_reads_no_object(flavor, moto_s3):
-    from pathlib_next.sync import PathSyncer
+    from pathapi.sync import PathSyncer
 
     for index in range(100):
         moto_s3.put_object(

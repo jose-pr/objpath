@@ -679,7 +679,7 @@ def test_rm_recursive_of_a_prefix_with_hidden_objects_removes_none(gs, odd_prefi
 
 
 def test_copy_recursive_of_a_prefix_with_hidden_objects_is_refused(gs, odd_prefix):
-    from pathlib_next.mempath import MemPath
+    from pathapi.mempath import MemPath
 
     backend, bucket, before = odd_prefix
     target = MemPath("/copied")

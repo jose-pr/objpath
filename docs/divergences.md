@@ -8,8 +8,8 @@ kwargs, new methods like `rm()` and `copy()`) are allowed. Any *behavioral* dive
 The divergences below apply to `S3Path`, `GSPath`, `AZPath` and the URI paths that delegate
 to them. The ones of the generic `Path` operations that every path inherits (`touch()` on a
 non-local backend, `rm()` and its policies, `chown()`, `Path.replace()`, a `with` block that
-raised while writing) are on the documentation site of `pathlib-next`,
-<https://jose-pr.github.io/pathlib-next/divergences/>.
+raised while writing) are on the documentation site of `pathapi`,
+<https://jose-pr.github.io/pathapi/divergences/>.
 
 | Method | `pathlib` | `S3Path`, `GSPath`, `AZPath` | Why |
 | --- | --- | --- | --- |

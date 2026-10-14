@@ -12,16 +12,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 The first release of `objpath`: the Amazon S3, Google Cloud Storage and Azure Blob
 Storage support of `pathlib-next` 0.9.14 (`pathlib_next.uri.schemes.s3`, `.gs` and
 `.az`) as a distribution of its own, with paths that need no URI. It needs Python 3.9 or
-newer and `pathlib-next>=0.10.0,<0.11`. No store SDK is required to import it: the extras
+newer and `pathapi>=0.1.0,<0.2`. No store SDK is required to import it: the extras
 `s3` (`boto3>=1.36.0,<2`), `gs` (`google-cloud-storage>=3.0,<4`) and `az`
 (`azure-storage-blob>=12.4.0,<13` and `azure-identity>=1.0,<2`) add one, and `uri`
 (`uripath>=0.1.0,<0.2`) adds the `s3:`, `gs:` and `az:` schemes. Under *Changed*, the
 migration from `pathlib_next.uri.schemes` comes in this order: the table of names, the
 table of extras, then every change of behaviour with what to do about it.
 
+It is built on `pathapi`, which was published as `pathlib-next` up to 0.10.0 (import
+name `pathlib_next`); the old names below are the ones before the move.
+
 ### Added
 
-- `S3Path`, `GSPath` and `AZPath`, `pathlib_next.Path` classes for the objects of a
+- `S3Path`, `GSPath` and `AZPath`, `pathapi.Path` classes for the objects of a
   bucket or container, built from keywords:
   `S3Path("dir/key", bucket="bkt")`, `GSPath("dir/key", bucket="bkt")`,
   `AZPath("dir/key", container="cont", account="acct")`. Nothing connects until the
@@ -35,7 +38,7 @@ table of extras, then every change of behaviour with what to do about it.
   `BaseGSBackend` and `BaseAZBackend`. Every backend is a context manager: `close()`
   closes the SDK client it built, the next use builds another, and calling it twice is
   harmless.
-- `objpath.exceptions`: `ObjPathError`, a `pathlib_next.PathError`, with
+- `objpath.exceptions`: `ObjPathError`, a `pathapi.PathError`, with
   `ObjectChangedError` and `UnreachableKeysError`, both also `OSError` (see *Changed*).
 - `objpath.uri`: `S3URIPath`, `GSURIPath` and `AZURIPath`, the `s3:`, `gs:` and `az:`
   schemes of `uripath`, found by `uripath` through the entry points `s3`, `gs` and `az` of
@@ -102,6 +105,9 @@ table of extras, then every change of behaviour with what to do about it.
 - `is_local()` of a store path is `False` without resolving anything. Was: the URI path resolved
   the bucket or account name as if it were a host name, so `PathSyncer(quick_check=True)` made a
   DNS lookup of it and read a name that resolved to this machine as local.
+- A write stream of a store that is garbage collected without being closed uploads nothing
+  and emits a `ResourceWarning`; `pathlib-next` closed it, and so uploaded it. What to do:
+  close the file, or use `with`.
 
 [Unreleased]: https://github.com/jose-pr/objpath/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/jose-pr/objpath/releases/tag/v0.1.0

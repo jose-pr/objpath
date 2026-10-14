@@ -598,7 +598,7 @@ def test_rm_recursive_of_a_prefix_with_hidden_blobs_removes_none(az, odd_prefix)
 
 
 def test_copy_recursive_of_a_prefix_with_hidden_blobs_is_refused(az, odd_prefix):
-    from pathlib_next.mempath import MemPath
+    from pathapi.mempath import MemPath
 
     backend, container, before = odd_prefix
     target = MemPath("/copied")
@@ -916,7 +916,7 @@ def test_a_rename_to_a_name_is_a_rename_to_a_sibling(az):
 
 
 def test_a_core_path_renames_only_inside_one_container_of_one_backend():
-    from pathlib_next.mempath import MemPath
+    from pathapi.mempath import MemPath
 
     backend, container = _container_with(**{"a.txt": b"content"})
     other_backend, _other = _container_with()

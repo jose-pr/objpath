@@ -19,8 +19,8 @@ except ImportError as _error:
 import errno as _errno
 import typing as _ty
 
-from pathlib_next import FileStat
-from pathlib_next import providers as _providers
+from pathapi import FileStat
+from pathapi import providers as _providers
 
 from ._az import AZPath
 from ._az_backend import BaseAZBackend

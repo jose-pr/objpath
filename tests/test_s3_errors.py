@@ -20,7 +20,7 @@ import botocore.exceptions as _botoexc
 from botocore.config import Config
 
 from objpath import BaseS3Backend, S3Backend
-from pathlib_next.mempath import MemPath
+from pathapi.mempath import MemPath
 from store_support import make_path
 
 # boto3 announces the end of its Python 3.9 support when it creates its first

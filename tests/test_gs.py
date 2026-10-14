@@ -12,7 +12,7 @@ import warnings
 import pytest
 
 import objstore_fakes
-from pathlib_next.testing import PathContract
+from pathapi.testing import PathContract
 from store_support import make_path
 
 # Imported here, with the SDK's import-time warnings ignored by `importorskip`,
@@ -141,7 +141,7 @@ def test_gs_object_that_is_also_a_prefix_lists_as_the_object(gs_server):
 
 
 def test_gs_prefix_with_a_hidden_subtree_is_not_copied_moved_or_removed(gs_server):
-    from pathlib_next.mempath import MemPath
+    from pathapi.mempath import MemPath
 
     path, _ = gs_server
     base = _object_that_is_also_a_prefix(path)
@@ -356,7 +356,7 @@ def test_gs_checksum_of_an_object_without_an_md5_is_refused(gs_server, gcs_api_s
 
 
 def test_gs_syncing_an_unchanged_tree_downloads_no_object(gs_server, gcs_api_server):
-    from pathlib_next.sync import PathSyncer
+    from pathapi.sync import PathSyncer
 
     path, _ = gs_server
     state = gcs_api_server.state

@@ -10,7 +10,7 @@
 `S3Path("reports/2026.csv", bucket="data")` has the method names, signatures and
 exception types of `pathlib.Path`, and `GSPath` and `AZPath` do the same for the
 other two stores; none needs a URI. They build on
-[`pathlib-next`](https://github.com/jose-pr/pathlib-next) alone; with
+[`pathapi`](https://github.com/jose-pr/pathapi) alone; with
 [`uripath`](https://github.com/jose-pr/uripath) installed the same package also
 provides the `s3:`, `gs:` and `az:` schemes. It is documented at
 <https://jose-pr.github.io/objpath/>.
@@ -25,7 +25,7 @@ provides the `s3:`, `gs:` and `az:` schemes. It is documented at
 
 - **A `pathlib` path on a bucket**: `open`, `read_text`, `iterdir`, `glob`, `stat`,
   `mkdir`, `rename` and the rest, plus `walk`, `copy`, `move`, `rm` and `PathSyncer` from
-  `pathlib-next`. Nothing connects until the first request.
+  `pathapi`. Nothing connects until the first request.
 - **Directories without directories**: `is_dir()` is a prefix test, listings use a
   delimiter and carry the size and time of each object, and the keys a walk cannot reach
   (an empty segment, a name that is both an object and a prefix) are named and refused
@@ -48,7 +48,7 @@ provides the `s3:`, `gs:` and `az:` schemes. It is documented at
 pip install "objpath[s3]"
 ```
 
-Requires `pathlib-next`, which pip installs with it, and Python 3.9 or newer.
+Requires `pathapi`, which pip installs with it, and Python 3.9 or newer.
 
 | Install | Adds |
 | --- | --- |
@@ -95,8 +95,8 @@ with S3Backend(endpoint_url="https://minio.example.org", region_name="us-east-1"
 
 <!-- example: skip: connects to S3 -->
 ```python
-from pathlib_next import LocalPath
-from pathlib_next.sync import PathSyncer
+from pathapi import LocalPath
+from pathapi.sync import PathSyncer
 from objpath import S3Path
 
 PathSyncer(remove_missing=True).sync(S3Path("logs", bucket="data"), LocalPath("mirror"))

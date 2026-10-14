@@ -20,7 +20,7 @@ from uripath import URIPath
 from objpath import BaseS3Backend, S3Backend, S3Path
 from objpath import _s3_backend
 from objpath.uri import S3URIPath
-from pathlib_next.mempath import MemPath
+from pathapi.mempath import MemPath
 
 # boto3 announces the end of its Python 3.9 support when it creates its first
 # client.
