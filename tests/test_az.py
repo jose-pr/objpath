@@ -3,7 +3,6 @@ Storage REST API: the SDK's real client talks to it over loopback, so what a
 test asserts on the server side is what the SDK sent. Every test that takes
 `az_server` runs for both classes."""
 
-
 import pytest
 from pathlib_next.testing import PathContract
 
