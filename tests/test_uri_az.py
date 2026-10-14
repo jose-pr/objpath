@@ -23,7 +23,7 @@ from objpath import AZBackend, AZPath, BaseAZBackend
 from objpath import _az_backend
 from objpath.exceptions import UnreachableKeysError
 from objpath.uri import AZURIPath
-from test_az_fake import (
+from az_fakes import (
     _FakeBackend,
     _Forbidden,
     _Missing,

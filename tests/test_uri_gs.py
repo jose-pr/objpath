@@ -16,7 +16,7 @@ from pathlib_next.mempath import MemPath  # noqa: E402
 
 from objpath import BaseGSBackend, GSBackend, GSPath, _gs_backend  # noqa: E402
 from objpath.uri import GSURIPath  # noqa: E402
-from test_gs_fake import (  # noqa: E402
+from gs_fakes import (  # noqa: E402
     _FakeBackend,
     _Forbidden,
     _bucket_with,
