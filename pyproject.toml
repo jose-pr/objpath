@@ -1,0 +1,101 @@
+[build-system]
+# PEP 639 `license`/`license-files` below need hatchling 1.27 or newer.
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "objpath"
+version = "0.10.0"
+authors = [{ name = "Jose A" }]
+description = "pathlib-style paths for S3, Google Cloud Storage and Azure Blob Storage, and the s3:, gs: and az: schemes for uripath"
+readme = "README.md"
+requires-python = ">=3.9"
+# PEP 639: SPDX license expression plus the file it refers to. This replaces
+# the legacy `License ::` classifier; do not list one alongside it.
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Operating System :: OS Independent",
+    # src/objpath/py.typed ships in the wheel.
+    "Typing :: Typed",
+]
+dependencies = [
+    "pathlib-next>=0.10.0,<0.11",
+]
+
+[project.optional-dependencies]
+# No store SDK is required: the first use of a store without its extra raises an
+# `ImportError` naming the extra.
+s3 = [
+    # PutObject(IfNoneMatch=) is rejected by 1.34; the tests build a client with
+    # Config(response_checksum_validation=), which botocore has from 1.36.
+    "boto3>=1.36.0,<2",
+]
+gs = ["google-cloud-storage>=3.0,<4"]
+az = [
+    # BlobPrefix is not exported from azure.storage.blob in 12.3.
+    "azure-storage-blob>=12.4.0,<13",
+    "azure-identity>=1.0,<2",
+]
+# The s3:, gs: and az: schemes of uripath. `import objpath` never imports uripath.
+uri = ["uripath>=0.10.0,<0.11"]
+all = ["objpath[s3,gs,az,uri]"]
+dev = [
+    'build',
+    'twine',
+    'hatchling',
+    'pytest',
+    'pytest-cov',
+    'black',
+    'moto[s3]',
+]
+docs = ['mkdocs', 'mkdocs-material', 'mkdocstrings[python]']
+
+# Declared whether or not uripath is installed: nothing reads the group
+# without it, and a class is imported only when a path of its scheme is built.
+[project.entry-points."uripath.schemes"]
+s3 = "objpath.uri:S3URIPath"
+gs = "objpath.uri:GSURIPath"
+az = "objpath.uri:AZURIPath"
+
+[project.urls]
+Homepage = "https://github.com/jose-pr/objpath/"
+Documentation = "https://jose-pr.github.io/objpath/"
+Issues = "https://github.com/jose-pr/objpath/issues"
+
+# Ship the consumer-facing docs inside the installed package, so they are
+# readable from site-packages via importlib.resources without the repo.
+# src/objpath/AGENTS.md (the API header) is included automatically by living
+# in the package dir. The repo-root AGENTS.md is contributor orientation for a
+# checkout and is not part of the wheel.
+[tool.hatch.build.targets.wheel.force-include]
+"README.md" = "objpath/README.md"
+
+# `*.local.*` files are per-machine overrides and `CLAUDE*` is agent config:
+# neither is ever packaged (both are also gitignored). `/.*` does not match
+# them, since their names do not start with a dot.
+[tool.hatch.build.targets.sdist]
+exclude = ["/.*", "/AGENTS.md", "/benchmarks", "*.local.*", "CLAUDE*"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/objpath"]
+exclude = ["*.local.*", "CLAUDE*"]
+
+[tool.black]
+# Pinned to the project's *minimum* supported Python so black never emits
+# syntax the 3.9 floor cannot parse.
+target-version = ["py39"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+xfail_strict = true
