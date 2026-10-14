@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-14
+
 The first release of `objpath`: the Amazon S3, Google Cloud Storage and Azure Blob
 Storage support of `pathlib-next` 0.9.14 (`pathlib_next.uri.schemes.s3`, `.gs` and
 `.az`) as a distribution of its own, with paths that need no URI. It needs Python 3.9 or
@@ -100,3 +102,6 @@ table of extras, then every change of behaviour with what to do about it.
 - `is_local()` of a store path is `False` without resolving anything. Was: the URI path resolved
   the bucket or account name as if it were a host name, so `PathSyncer(quick_check=True)` made a
   DNS lookup of it and read a name that resolved to this machine as local.
+
+[Unreleased]: https://github.com/jose-pr/objpath/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/jose-pr/objpath/releases/tag/v0.1.0
