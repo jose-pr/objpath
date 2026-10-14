@@ -12,7 +12,7 @@ from pathlib_next.providers import check_follow, copy_error_predicate
 from uripath.schemes import DelegatingURIPath
 
 from ._keys import parse_names
-from ._storepath import checked_copy
+from ._keys import checked_copy
 
 
 class ObjectStoreURIPath(DelegatingURIPath):

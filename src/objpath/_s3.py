@@ -21,7 +21,9 @@ from ._s3_errors import (
     oserror,
     reply_oserror,
 )
-from ._storepath import ObjectStorePath, check_place, digest_hex
+from ._digests import digest_hex
+from ._places import check_place
+from ._storepath import ObjectStorePath
 from ._writer import SpoolUploadStream
 
 _PUT_OBJECT_LIMIT = 5 * 1024**3

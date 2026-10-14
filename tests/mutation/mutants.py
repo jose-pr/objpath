@@ -191,7 +191,7 @@ mutant(
 
 mutant(
     "store-recursive-copy-of-unreachable-keys",
-    "_storepath.py",
+    "_keys.py",
     '    unreachable = path._unreachable_keys()\n    if unreachable:\n        raise refusal(path, "copy", unreachable)',
     '    unreachable = path._unreachable_keys()\n    if False:\n        raise refusal(path, "copy", unreachable)',
     "tests/test_s3.py::test_copy_recursive_of_such_a_prefix_is_refused_before_anything_is_written",
@@ -238,7 +238,7 @@ mutant(
 
 mutant(
     "store-place-is-required",
-    "_storepath.py",
+    "_places.py",
     '        if donor is None:\n            raise TypeError(f"{owner} needs {kind}= (or a segment that is an {owner})")\n',
     '        if False:\n            raise TypeError(f"{owner} needs {kind}= (or a segment that is an {owner})")\n',
     "tests/test_s3_path.py::test_a_path_without_a_bucket_is_a_type_error",
@@ -247,7 +247,7 @@ mutant(
 
 mutant(
     "store-place-may-hold-a-slash",
-    "_storepath.py",
+    "_places.py",
     '    if not value or "/" in value:\n',
     "    if not value:\n",
     "tests/test_s3_path.py::test_the_bucket_must_be_a_name_with_no_slash",

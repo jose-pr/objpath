@@ -12,7 +12,9 @@ from ._gs_backend import UNSET, BaseGSBackend, GSBackend, _default_backend
 from ._gs_errors import BatchReplyError, http_status, oserror, translate_errors
 from . import _reader
 from ._reader import RangeReader
-from ._storepath import ObjectStorePath, check_place, digest_hex
+from ._digests import digest_hex
+from ._places import check_place
+from ._storepath import ObjectStorePath
 from ._writer import SPOOL_SIZE, SpoolUploadStream
 
 _DELETE_BATCH = 100

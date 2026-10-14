@@ -4,70 +4,25 @@ keys under it and `mkdir()` writes an empty `key/` marker."""
 
 from __future__ import annotations
 
-import base64 as _base64
-import contextlib as _contextlib
 import errno as _errno
 import stat as _stat
-import threading as _threading
 import typing as _ty
 import urllib.parse as _urlparse
 
 from pathlib_next import FileStat, Path, Pathname
 from pathlib_next.providers import TreePath, check_follow, copy_error_predicate
 
-from ._keys import parse_names, refusal, split_names, unreachable_keys
-
-_state = _threading.local()
+from ._keys import (
+    checked_copy,
+    parse_names,
+    refusal,
+    split_names,
+    unreachable_keys,
+)
+from ._places import rebuild_path
 
 #: What a path text keeps unescaped when it is spelled as a URI.
 _SAFE_KEY = "!$&'()*+,;=:@/"
-
-
-def digest_hex(encoded: str) -> str:
-    """The hex digest of `encoded`, the base64 text a store reports one in."""
-    return _base64.b64decode(encoded).hex()
-
-
-@_contextlib.contextmanager
-def checked_copy(path, recursive: bool):
-    """Around `Path.copy()` of an object-store `path`: a recursive copy of a
-    prefix is refused, before anything is created, when it holds keys the
-    walk would leave behind. Children are copied through the same method;
-    only the outermost call checks."""
-    if not recursive or getattr(_state, "copying", False):
-        yield
-        return
-    unreachable = path._unreachable_keys()
-    if unreachable:
-        raise refusal(path, "copy", unreachable)
-    _state.copying = True
-    try:
-        yield
-    finally:
-        _state.copying = False
-
-
-def check_place(kind: str, value, donor, owner: str) -> str:
-    """The name of the bucket or container (`kind`) that the constructor of
-    `owner` was given as `value`, else the one of the path `donor` it is
-    joined from. `TypeError` when there is none or it is not a string,
-    `ValueError` when it is empty or holds a `/`."""
-    if value is None:
-        if donor is None:
-            raise TypeError(f"{owner} needs {kind}= (or a segment that is an {owner})")
-        return donor._place
-    if not isinstance(value, str):
-        raise TypeError(f"{kind}= must be a str, not {type(value).__name__!r}")
-    if not value or "/" in value:
-        raise ValueError(f"{kind}= must be a name with no '/' in it, not {value!r}")
-    return value
-
-
-def rebuild_path(cls, segments, keywords):
-    """Unpickles a path: `cls(**keywords)` with the names it had."""
-    path = cls(**keywords)
-    path._segments = segments
-    return path
 
 
 class ObjectStorePath(TreePath):

@@ -8,12 +8,16 @@ listing of the prefix holds all of them.
 
 from __future__ import annotations
 
+import contextlib as _contextlib
 import errno as _errno
+import threading as _threading
 import typing as _ty
 
 from pathlib_next import providers as _providers
 
 from .exceptions import UnreachableKeysError
+
+_state = _threading.local()
 
 
 def unreachable_keys(
@@ -94,3 +98,22 @@ def split_names(text: str) -> "tuple[str, ...]":
     if text in ("", "."):
         return ()
     return tuple(text.split("/"))
+
+
+@_contextlib.contextmanager
+def checked_copy(path, recursive: bool):
+    """Around `Path.copy()` of an object-store `path`: a recursive copy of a
+    prefix is refused, before anything is created, when it holds keys the
+    walk would leave behind. Children are copied through the same method;
+    only the outermost call checks."""
+    if not recursive or getattr(_state, "copying", False):
+        yield
+        return
+    unreachable = path._unreachable_keys()
+    if unreachable:
+        raise refusal(path, "copy", unreachable)
+    _state.copying = True
+    try:
+        yield
+    finally:
+        _state.copying = False

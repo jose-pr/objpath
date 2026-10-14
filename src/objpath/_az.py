@@ -19,7 +19,8 @@ from ._az_backend import (
 from ._az_errors import http_status, oserror, translate_errors
 from ._optional import import_client as _import_client
 from ._reader import RangeReader
-from ._storepath import ObjectStorePath, check_place
+from ._places import check_place
+from ._storepath import ObjectStorePath
 from ._writer import SPOOL_SIZE, SpoolUploadStream
 
 _AZWriteStream = SpoolUploadStream
