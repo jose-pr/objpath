@@ -1,11 +1,9 @@
-"""List keys in an S3 bucket using S3Path.
-Requires `boto3` and the `s3` extra (`pip install pathlib_next[s3]`), as well
-as valid AWS credentials configured (via environment variables, AWS CLI,
-or IAM role) -- guarded under `if __name__ == "__main__"` so importing this
-module is always safe, and skipped (prints setup instructions, exit 0) unless
-S3_EXAMPLE_BUCKET is set.
+"""List keys in an S3 bucket using `S3Path`.
 
-Run directly:
+Needs the `s3` extra (`pip install "objpath[s3]"`) and AWS credentials that
+boto3 finds (environment variables, the AWS CLI configuration or an IAM role).
+Importing this module is always safe; run as a script it does nothing, and
+exits 0, unless S3_EXAMPLE_BUCKET is set.
 
     export S3_EXAMPLE_BUCKET=my-s3-bucket
     export S3_EXAMPLE_PREFIX=some/folder/   # optional
@@ -15,14 +13,12 @@ Run directly:
 import os
 import sys
 
-from pathlib_next.uri import UriPath
+from objpath import S3Path
 
 
 def list_s3(bucket: str, prefix: str):
-    # s3://bucket/prefix/path
-    s3_uri = f"s3://{bucket}/{prefix.lstrip('/')}"
-    root = UriPath(s3_uri)
-    print(f"Listing S3 location: {s3_uri}")
+    root = S3Path(prefix, bucket=bucket)
+    print(f"Listing S3 location: {root}")
     for child in root.iterdir():
         kind = "dir " if child.is_dir() else "file"
         size = "" if child.is_dir() else f" ({child.stat().st_size} bytes)"
