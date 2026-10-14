@@ -1,0 +1,198 @@
+{
+  "schema": "objpath.bench/1",
+  "name": "baseline-local-0.10.0-py3.14-nt-arm64",
+  "suite": "default",
+  "source": "local",
+  "note": "Local sanity baseline of the suite; not CI, not a performance claim.",
+  "created_utc": "2026-10-14T08:22:34+00:00",
+  "package": {
+    "name": "objpath",
+    "version": "0.10.0"
+  },
+  "git": {
+    "commit": "64d45380e3e55bd8991ce6d44b3d66b248ca2da9",
+    "dirty": false
+  },
+  "python": "CPython 3.14.7",
+  "interpreter": "3.14-nt-arm64",
+  "processor": "Windows-ARM64",
+  "cpu_count": 12,
+  "metrics": {
+    "s3-uri: copy() of 256 KiB, server side": {
+      "group": "s3-uri",
+      "min_ms": 4.4424,
+      "median_ms": 4.4615,
+      "max_ms": 4.6289,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3-uri: iterdir() of 72 entries": {
+      "group": "s3-uri",
+      "min_ms": 8.8875,
+      "median_ms": 9.1854,
+      "max_ms": 9.2338,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3-uri: mkdir()": {
+      "group": "s3-uri",
+      "min_ms": 2.772,
+      "median_ms": 2.7943,
+      "max_ms": 2.8919,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3-uri: read_bytes() of 256 KiB": {
+      "group": "s3-uri",
+      "min_ms": 1.108,
+      "median_ms": 1.141,
+      "max_ms": 1.1994,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3-uri: rename() of 256 KiB": {
+      "group": "s3-uri",
+      "min_ms": 4.5491,
+      "median_ms": 4.7485,
+      "max_ms": 5.032,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3-uri: rm(recursive=True) of 33 objects": {
+      "group": "s3-uri",
+      "min_ms": 7.2845,
+      "median_ms": 7.6395,
+      "max_ms": 9.4823,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3-uri: stat() of an object": {
+      "group": "s3-uri",
+      "min_ms": 0.9006,
+      "median_ms": 0.9264,
+      "max_ms": 1.1352,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3-uri: unlink()": {
+      "group": "s3-uri",
+      "min_ms": 1.7705,
+      "median_ms": 1.8008,
+      "max_ms": 1.8226,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3-uri: walk() of 72 entries": {
+      "group": "s3-uri",
+      "min_ms": 8.7903,
+      "median_ms": 9.1166,
+      "max_ms": 9.1436,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3-uri: write_bytes() of 256 KiB": {
+      "group": "s3-uri",
+      "min_ms": 3.3733,
+      "median_ms": 3.5421,
+      "max_ms": 5.5346,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: copy() of 256 KiB, server side": {
+      "group": "s3",
+      "min_ms": 4.7098,
+      "median_ms": 4.8649,
+      "max_ms": 5.4321,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: iterdir() of 72 entries": {
+      "group": "s3",
+      "min_ms": 8.7348,
+      "median_ms": 8.8729,
+      "max_ms": 8.9941,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: mkdir()": {
+      "group": "s3",
+      "min_ms": 2.7736,
+      "median_ms": 3.2679,
+      "max_ms": 3.3321,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: read_bytes() of 256 KiB": {
+      "group": "s3",
+      "min_ms": 1.0811,
+      "median_ms": 1.1136,
+      "max_ms": 1.2212,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: rename() of 256 KiB": {
+      "group": "s3",
+      "min_ms": 5.0713,
+      "median_ms": 5.2719,
+      "max_ms": 7.0311,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: rm(recursive=True) of 33 objects": {
+      "group": "s3",
+      "min_ms": 7.8627,
+      "median_ms": 9.0944,
+      "max_ms": 9.4014,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: stat() of an object": {
+      "group": "s3",
+      "min_ms": 0.8842,
+      "median_ms": 1.1838,
+      "max_ms": 2.1318,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: unlink()": {
+      "group": "s3",
+      "min_ms": 1.6707,
+      "median_ms": 1.7374,
+      "max_ms": 2.0065,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: walk() of 72 entries": {
+      "group": "s3",
+      "min_ms": 8.4348,
+      "median_ms": 8.6319,
+      "max_ms": 8.8156,
+      "samples": 5,
+      "calls_per_sample": 1
+    },
+    "s3: write_bytes() of 256 KiB": {
+      "group": "s3",
+      "min_ms": 3.5434,
+      "median_ms": 3.6319,
+      "max_ms": 3.863,
+      "samples": 5,
+      "calls_per_sample": 1
+    }
+  },
+  "counters": {
+    "s3-uri: requests of rm(recursive=True) of 33 objects": {
+      "group": "s3-uri",
+      "HeadObject": 1,
+      "ListObjectsV2": 1,
+      "DeleteObjects": 1
+    },
+    "s3: requests of rm(recursive=True) of 33 objects": {
+      "group": "s3",
+      "HeadObject": 1,
+      "ListObjectsV2": 1,
+      "DeleteObjects": 1
+    }
+  },
+  "errors": {},
+  "skipped": {}
+}
