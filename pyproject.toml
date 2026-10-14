@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "objpath"
-version = "0.10.0"
+version = "0.1.0"
 authors = [{ name = "Jose A" }]
 description = "pathlib-style paths for S3, Google Cloud Storage and Azure Blob Storage, and the s3:, gs: and az: schemes for uripath"
 readme = "README.md"
@@ -46,7 +46,7 @@ az = [
     "azure-identity>=1.0,<2",
 ]
 # The s3:, gs: and az: schemes of uripath. `import objpath` never imports uripath.
-uri = ["uripath>=0.10.0,<0.11"]
+uri = ["uripath>=0.1.0,<0.2"]
 all = ["objpath[s3,gs,az,uri]"]
 dev = [
     'build',

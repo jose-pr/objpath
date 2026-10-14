@@ -13,7 +13,7 @@ Storage support of `pathlib-next` 0.9.14 (`pathlib_next.uri.schemes.s3`, `.gs` a
 newer and `pathlib-next>=0.10.0,<0.11`. No store SDK is required to import it: the extras
 `s3` (`boto3>=1.36.0,<2`), `gs` (`google-cloud-storage>=3.0,<4`) and `az`
 (`azure-storage-blob>=12.4.0,<13` and `azure-identity>=1.0,<2`) add one, and `uri`
-(`uripath>=0.10.0,<0.11`) adds the `s3:`, `gs:` and `az:` schemes. Under *Changed*, the
+(`uripath>=0.1.0,<0.2`) adds the `s3:`, `gs:` and `az:` schemes. Under *Changed*, the
 migration from `pathlib_next.uri.schemes` comes in this order: the table of names, the
 table of extras, then every change of behaviour with what to do about it.
 
