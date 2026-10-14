@@ -256,9 +256,13 @@ def test_missing_sdk_is_import_error_not_file_not_found(flavor, monkeypatch):
 # --- the options of a client reach it unchanged ------------------------------
 
 
-def test_connection_string_keeps_the_other_kwargs(walk_sdk, monkeypatch):
+@pytest.mark.parametrize("sdk_hidden", [False, True], ids=["sdk", "no-sdk"])
+def test_connection_string_keeps_the_other_kwargs(sdk_hidden, request, monkeypatch):
     import importlib
 
+    if sdk_hidden:
+        monkeypatch.setitem(sys.modules, "azure.storage.blob", None)
+    request.getfixturevalue("walk_sdk")
     built = []
 
     class BlobServiceClient:
@@ -267,10 +271,12 @@ def test_connection_string_keeps_the_other_kwargs(walk_sdk, monkeypatch):
             built.append((conn_str, credential, kwargs))
             return object.__new__(cls)
 
+    # The stand-in module `walk_sdk` installs without the SDK has no such name.
     monkeypatch.setattr(
         importlib.import_module("azure.storage.blob"),
         "BlobServiceClient",
         BlobServiceClient,
+        raising=False,
     )
     AZBackend(
         connection_string="cs", credential="token", max_single_put_size=4
