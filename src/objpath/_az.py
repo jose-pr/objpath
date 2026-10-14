@@ -1,202 +1,28 @@
 from __future__ import annotations
 
-import contextlib as _contextlib
 import errno as _errno
 import io as _io
 import itertools as _itertools
-import sys as _sys
-import threading as _thread
 import time as _time
 import typing as _ty
 
-from ... import providers as _providers
-from ... import FileStat
-from .. import Uri
-from . import _objstore as _store
-from ._extras import import_client as _import_client
+from pathlib_next import FileStat
+from pathlib_next import providers as _providers
 
+from . import _failures
+from ._az_backend import (
+    _DEFAULT_BACKENDS,
+    AZBackend,
+    BaseAZBackend,
+    _default_backend,
+)
+from ._az_errors import http_status, oserror, translate_errors
+from ._optional import import_client as _import_client
+from ._reader import RangeReader
+from ._storepath import ObjectStorePath, check_place
+from ._writer import SPOOL_SIZE, SpoolUploadStream
 
-class BaseAzBackend(object):
-    """Protocol for obtaining an `azure.storage.blob.BlobServiceClient`.
-    Subclass this to plug in custom credential/session handling (e.g. tests
-    can override to point at a fake server); `AzBackend` is the real
-    implementation."""
-
-    # Weakly referenceable so `UriPath` can record which backends a path
-    # derived for itself (see `UriPath._supplied_backend()`).
-    __slots__ = ("__weakref__",)
-
-    @_providers.notimplemented
-    def client(self):
-        """The `BlobServiceClient` every call of a path goes through."""
-
-
-def _default_credential():
-    try:
-        from azure.identity import DefaultAzureCredential
-    except ImportError as error:
-        raise ImportError(
-            "az:// paths without an explicit backend authenticate with "
-            "azure-identity's DefaultAzureCredential, which is not installed: "
-            'pip install "pathlib-next[az]" (the az extra), or pass '
-            "backend=AzBackend(account_url=..., credential=...) or "
-            "AzBackend(connection_string=...)"
-        ) from error
-    return DefaultAzureCredential()
-
-
-class AzBackend(BaseAzBackend):
-    """Lazily creates+caches an `azure.storage.blob.BlobServiceClient`. A
-    single client is reused across threads -- it's documented as
-    thread-safe.
-
-    `client_kwargs` go to `BlobServiceClient` unchanged; with
-    `connection_string`, to `BlobServiceClient.from_connection_string`
-    (`credential` and the other options included). `account`, when given
-    and neither `account_url` nor `connection_string` is, derives
-    `account_url="https://<account>.blob.core.windows.net"`, authenticated
-    by azure-identity's `DefaultAzureCredential` unless `credential` is
-    passed -- the backend an `AzPath` built without `backend=` uses."""
-
-    __slots__ = ("client_kwargs", "account", "_client", "_client_lock")
-
-    def __init__(self, account: "str | None" = None, **client_kwargs):
-        self.client_kwargs = client_kwargs
-        self.account = account
-        self._client = None
-        self._client_lock = _thread.Lock()
-
-    def client(self):
-        return _store.lazy_client(self, self._build_client)
-
-    def _build_client(self):
-        BlobServiceClient = _import_client("azure.storage.blob", "az").BlobServiceClient
-
-        kwargs = dict(self.client_kwargs)
-        if "connection_string" in kwargs:
-            connection_string = kwargs.pop("connection_string")
-            return BlobServiceClient.from_connection_string(connection_string, **kwargs)
-        if "account_url" not in kwargs and self.account:
-            kwargs["account_url"] = f"https://{self.account}.blob.core.windows.net"
-            if "credential" not in kwargs:
-                kwargs["credential"] = _default_credential()
-        return BlobServiceClient(**kwargs)
-
-    # A pickled or copied backend keeps its options and builds its own
-    # client (and credential) on first use.
-    def __getstate__(self):
-        return _store.backend_state(self)
-
-    def __setstate__(self, state):
-        _store.restore_backend(self, state)
-
-
-_DEFAULT_BACKENDS: "dict[str, AzBackend]" = {}
-_DEFAULT_BACKENDS_LOCK = _thread.Lock()
-
-
-def _default_backend(account: str) -> AzBackend:
-    """One shared default backend per account, so separately built paths
-    reuse one client (and one credential) instead of building their own."""
-    with _DEFAULT_BACKENDS_LOCK:
-        backend = _DEFAULT_BACKENDS.get(account)
-        if backend is None:
-            backend = _DEFAULT_BACKENDS[account] = AzBackend(account=account)
-        return backend
-
-
-def _http_status(error: BaseException) -> "int | None":
-    """The HTTP status of an `azure.core.exceptions.HttpResponseError`
-    (`ResourceNotFoundError`, `ResourceExistsError`, ...), read from its
-    `status_code` attribute -- or its type when the SDK set none -- so the
-    SDK need not be importable to classify it. None for anything that is
-    not an error reply."""
-    if isinstance(error, OSError):
-        return None
-    status = getattr(error, "status_code", None)
-    if isinstance(status, int) and not isinstance(status, bool):
-        return status
-    try:
-        from azure.core import exceptions as _azexc
-    except ImportError:
-        return None
-    if isinstance(error, _azexc.ResourceNotFoundError):
-        return 404
-    if isinstance(error, _azexc.ResourceExistsError):
-        return 409
-    if isinstance(error, _azexc.ClientAuthenticationError):
-        return 401
-    if isinstance(error, _azexc.HttpResponseError):
-        return 500
-    return None
-
-
-def _transport_kind(error: BaseException) -> "str | None":
-    """Which `_store.transport_error()` kind `error` is when it is the SDK's
-    report of a connection failure (not of a reply), else None."""
-    # An SDK error exists only once its module is loaded, so there is nothing
-    # to import here.
-    azexc = _sys.modules.get("azure.core.exceptions")
-    if azexc is None:
-        return None
-    timeouts = tuple(
-        getattr(azexc, name)
-        for name in ("ServiceRequestTimeoutError", "ServiceResponseTimeoutError")
-        if hasattr(azexc, name)
-    )
-    if isinstance(error, timeouts):
-        return _store.TIMEOUT
-    if isinstance(error, azexc.ServiceRequestError):
-        # The request could not be sent: no connection, no name, no route.
-        return _store.TIMEOUT if _store.mentions_timeout(error) else _store.UNREACHABLE
-    if isinstance(error, azexc.ServiceResponseError):
-        # Sent, but the answer did not arrive whole.
-        return _store.TIMEOUT if _store.mentions_timeout(error) else _store.INTERRUPTED
-    incomplete = getattr(azexc, "IncompleteReadError", None)
-    if incomplete is not None and isinstance(error, incomplete):
-        return _store.INTERRUPTED
-    return None
-
-
-def _oserror(error: BaseException, path, *, create=False):
-    """The OSError an error reply or a connection failure means for `path`,
-    or None for any other exception (a missing SDK, bad configuration, a
-    bug), which must propagate as itself rather than read as "no such
-    file". `create`: the reply answers a conditional create, where 409/412
-    mean the blob exists (elsewhere a 412 is e.g. a lease held by someone
-    else). A request that ran out of time is TimeoutError, an endpoint that
-    cannot be reached ConnectionError. Raise it `from None`."""
-    kind = _transport_kind(error)
-    if kind is not None:
-        return _store.transport_error(kind, "Azure", path, error)
-    status = _http_status(error)
-    if status is None:
-        return None
-    if status == 404:
-        return FileNotFoundError(
-            _errno.ENOENT, f"No such file or directory ({error})", str(path)
-        )
-    if status in (401, 403):
-        return PermissionError(_errno.EACCES, str(error), str(path))
-    if create and status in (409, 412):
-        return FileExistsError(_errno.EEXIST, f"File exists ({error})", str(path))
-    if status in (408, 504):
-        return _store.transport_error(_store.TIMEOUT, "Azure", path, error)
-    return OSError(_errno.EIO, f"Azure request failed: {error}", str(path))
-
-
-@_contextlib.contextmanager
-def _translate_errors(path, *, create=False):
-    try:
-        yield
-    except Exception as error:
-        translated = _oserror(error, path, create=create)
-        if translated is None:
-            raise
-        raise translated from None
-
-
-_AzWriteStream = _store.SpoolUploadStream
+_AZWriteStream = SpoolUploadStream
 
 
 class _ReadOnly:
@@ -207,17 +33,6 @@ class _ReadOnly:
     def __init__(self, file):
         self.read = file.read
 
-
-READ_CHUNK = 512 * 1024
-"""Bytes of a blob that one request of a streamed read asks for. The SDK holds
-about nine times a response while it handles it: assign a larger number to
-trade that memory for fewer requests."""
-
-COPY_POLL_TIMEOUT = 300.0
-"""Seconds `AzPath.rename()` waits for the server-side copy to finish. A copy
-inside one account is normally done when it is started; past this the copy is
-aborted (the destination may still appear if the abort fails) and `rename()`
-raises `TimeoutError`, the source untouched."""
 
 _COPY_POLL_INTERVAL = 0.1
 
@@ -251,14 +66,14 @@ def _if_not_modified():
     return MatchConditions.IfNotModified
 
 
-class _AzSnapshot:
+class _AZSnapshot:
     """The ranged reads of one open stream, as one version of the blob. The
     first response reports the blob's ETag and every later request requires
     it, so a blob replaced between two of them answers 412 and the stream
     raises instead of returning the bytes of two blobs. Each open has its own,
     so two opens are two snapshots."""
 
-    def __init__(self, path: "AzPath", blob_client):
+    def __init__(self, path: "AZPath", blob_client):
         self.object_path = path
         self._client = blob_client
         self.etag = None
@@ -271,14 +86,14 @@ class _AzSnapshot:
 
     def _failure(self, error: BaseException) -> "OSError | None":
         path = self.object_path
-        if _http_status(error) == 412 and self.etag is not None:
+        if http_status(error) == 412 and self.etag is not None:
             # Replaced -- or deleted, which a service may also answer 412.
             if path._has_object(path.key):
-                return _store.changed_error(path)
+                return _failures.changed_error(path)
             return FileNotFoundError(
                 _errno.ENOENT, "No such file or directory", str(path)
             )
-        return _oserror(error, path)
+        return oserror(error, path)
 
     def fetch(self, start: int, length: int) -> bytes:
         """The bytes from `start`, at most `length`; none at or past the end (a
@@ -289,7 +104,7 @@ class _AzSnapshot:
             )
             data = downloader.readall()
         except Exception as error:
-            if _http_status(error) == 416:
+            if http_status(error) == 416:
                 return b""
             failure = self._failure(error)
             if failure is None:
@@ -320,67 +135,129 @@ class _AzSnapshot:
             raise failure from None
 
 
-class AzPath(_store.ObjectStorePath):
-    """`az:` scheme (`az://account/container/key/path`): read/write/list via
-    `azure.storage.blob`. Requires the `az` extra. Azure Blob has no real
-    directories -- `is_dir()` is prefix emulation (any blob key under
-    `"<path>/"`), and `mkdir()` creates a zero-byte `"<path>/"` marker blob;
-    see `docs/divergences.md`. `rename()` uses server-side copy + delete
-    (same-container only) instead of the generic download+upload+delete
-    `move()` fallback; a prefix directory is not renamed
-    (NotImplementedError), so `move()` copies and removes it.
+class AZPath(ObjectStorePath):
+    """A path in an Azure Blob Storage container, read and written through
+    `azure.storage.blob`. Needs the `az` extra.
 
-    Without `backend=`, the client targets the URI's account
-    (`https://<account>.blob.core.windows.net`) with azure-identity's
-    `DefaultAzureCredential`; ImportError if azure-identity is missing."""
+    `AZPath("dir/key", container="cont", account="acct")` is the blob
+    `dir/key` of the container `cont` of the storage account `acct`, reached
+    through `https://acct.blob.core.windows.net` with azure-identity's
+    `DefaultAzureCredential` (an `ImportError` naming the extra if
+    azure-identity is missing); paths of one account share one default
+    backend per process. Client options (`credential=`, `account_url=`,
+    `connection_string=`, ...) build the path's own `AZBackend`, `account=`
+    among them or not; `backend=` shares one client between paths built
+    separately, or plugs in a `BaseAZBackend` of your own. Giving `backend=`
+    together with `account=` or a client option is a `TypeError`, and so is
+    giving none of them (unless a segment is an `AZPath`, whose backend is
+    kept). A path joined from another keeps its container and its backend, and
+    `container=` moves it to another container on the same backend. Nothing
+    connects when a path is built.
 
-    __SCHEMES = ("az",)
+    Azure Blob has no real directories -- `is_dir()` is prefix emulation (any
+    blob key under `"<path>/"`), and `mkdir()` creates a zero-byte
+    `"<path>/"` marker blob. `rename()` uses server-side copy + delete (same
+    container only) instead of the generic download+upload+delete `move()`
+    fallback; a prefix directory is not renamed (NotImplementedError), so
+    `move()` copies and removes it."""
+
     __slots__ = ()
     _TOP = "container"
     _LISTING_ERRORS = (Exception,)
 
     if _ty.TYPE_CHECKING:
-        backend: BaseAzBackend
+        _backend: BaseAZBackend
 
-    def _initbackend(self):
-        self._check_account()
-        return _default_backend(self.account)
-
-    def _check_account(self) -> None:
-        """FileNotFoundError for a path with no account whose backend is the
-        default one; a backend the caller supplied names its own account."""
-        if not self.account and self._supplied_backend() is None:
-            raise FileNotFoundError(
-                _errno.ENOENT, "an az: path needs a storage account", str(self)
+    def __init__(
+        self,
+        *segments: "str | AZPath",
+        container: "str | None" = None,
+        account: "str | None" = None,
+        backend: "BaseAZBackend | None" = None,
+        **client_kwargs,
+    ):
+        text, donor = self._join(segments)
+        place = check_place("container", container, donor, "AZPath")
+        if backend is not None and (account is not None or client_kwargs):
+            raise TypeError(
+                "pass either backend= or account= and the client options "
+                "(credential=, account_url=, ...), not both"
             )
+        if account is not None:
+            check_place("account", account, None, "AZPath")
+        if backend is None:
+            if client_kwargs:
+                backend = AZBackend(account, **client_kwargs)
+            elif account is not None:
+                backend = _default_backend(account)
+            elif donor is not None:
+                backend = donor._backend
+            else:
+                raise TypeError(
+                    "an AZPath needs account=, backend= or the client options"
+                )
+        self._initialize(text, place, backend)
+
+    def _keywords(self) -> dict:
+        return {"container": self._place}
+
+    def _identity(self) -> tuple:
+        # Two accounts can each hold a container of one name.
+        return (self.account or "", self._place, self.key)
+
+    def _backend_setting(self, name: str):
+        """The `read_chunk` or `copy_timeout` of this path's backend; a backend
+        that does not define it has the default of `BaseAZBackend`."""
+        return getattr(self._backend, name, getattr(BaseAZBackend, name))
+
+    def _default_keywords(self) -> dict:
+        account = self.account
+        if account is None:
+            raise TypeError(
+                f"cannot pickle an {type(self).__name__} whose backend is not "
+                "picklable and names no account"
+            )
+        return {"account": account}
+
+    def _uri_root(self) -> str:
+        account = self.account
+        if account is None:
+            raise NotImplementedError("as_uri() needs a backend that names its account")
+        return f"az://{account}/{self._place}"
+
+    def __str__(self) -> str:
+        try:
+            return self.as_uri()
+        except NotImplementedError:
+            return f"az:///{self._place}/{self.key}"
+
+    def __repr__(self) -> str:
+        shown = [repr(self.as_posix()), f"container={self._place!r}"]
+        backend = self._backend
+        account = self.account
+        if account is not None and backend is _DEFAULT_BACKENDS.get(account):
+            shown.append(f"account={account!r}")
+        else:
+            shown.append(f"backend={backend!r}")
+        return f"{type(self).__name__}({', '.join(shown)})"
 
     @property
-    def account(self) -> str:
-        return self.source.host
+    def account(self) -> "str | None":
+        """The storage account, when the backend names it."""
+        return getattr(self._backend, "account", None)
 
     @property
     def container(self) -> str:
-        return self.path.lstrip("/").split("/", 1)[0]
-
-    @property
-    def key(self) -> str:
-        # Everything after the container, minus exactly one trailing "/" (`az://acct/cont/dir/`
-        # is the directory `dir`, as on s3:/gs:); interior empty segments (`a//b`) are
-        # literal blob-name bytes.
-        _container, _, key = self.path.lstrip("/").partition("/")
-        return key[:-1] if key.endswith("/") else key
+        """The name of the container."""
+        return self._place
 
     @property
     def _client(self):
-        return self.backend.client()
+        return self._backend.client()
 
     @property
     def _container(self):
-        return self._client.get_container_client(self.container)
-
-    def _key_path(self, key: str) -> "AzPath":
-        """The path of the blob `key` in this path's container."""
-        return self.with_path(f"/{self.container}/{key}")
+        return self._client.get_container_client(self._place)
 
     def _properties(self, key: str):
         """The properties of the blob at `key`, or None if there is no such
@@ -388,7 +265,7 @@ class AzPath(_store.ObjectStorePath):
         reply)."""
         blob_client = self._container.get_blob_client(key)
         try:
-            with _translate_errors(self):
+            with translate_errors(self):
                 return blob_client.get_blob_properties()
         except FileNotFoundError:
             return None
@@ -398,17 +275,9 @@ class AzPath(_store.ObjectStorePath):
         # reuse it instead of `iterdir()` + a stat call per child.
         BlobPrefix = _import_client("azure.storage.blob", "az").BlobPrefix
 
-        if not self.container:
-            # The account: its containers are its directories.
-            with _translate_errors(self):
-                names = [item.name for item in self._client.list_containers()]
-            for name in names:
-                if _providers.is_safe_child_name(name):
-                    yield name, FileStat(is_dir=True)
-            return
         prefix = f"{self.key}/" if self.key else ""
         seen = set()
-        with _translate_errors(self):
+        with translate_errors(self):
             # walk_blobs provides both blobs and common prefixes (directories)
             items = list(
                 self._container.walk_blobs(name_starts_with=prefix, delimiter="/")
@@ -447,28 +316,32 @@ class AzPath(_store.ObjectStorePath):
                 )
 
     def _open(self, mode="r", buffering=-1):
-        self._check_account()
         if mode in ("r", "r+"):
             if not self.key:
-                # An account or a container, not a blob.
+                # A container, not a blob.
                 raise IsADirectoryError(_errno.EISDIR, "Is a directory", str(self))
             # The client is resolved outside the translation, so a missing
             # SDK or an unusable default backend raises as itself instead of
             # FileNotFoundError.
-            snapshot = _AzSnapshot(self, self._container.get_blob_client(self.key))
+            snapshot = _AZSnapshot(self, self._container.get_blob_client(self.key))
             try:
-                first = snapshot.fetch(0, READ_CHUNK)
+                first = snapshot.fetch(0, self._backend_setting("read_chunk"))
             except FileNotFoundError:
                 if self.is_dir():
                     raise IsADirectoryError(
                         _errno.EISDIR, "Is a directory", str(self)
                     ) from None
                 raise
-            raw = _store.RangeReader(snapshot.fetch, snapshot.size, first, READ_CHUNK)
+            raw = RangeReader(
+                snapshot.fetch,
+                snapshot.size,
+                first,
+                self._backend_setting("read_chunk"),
+            )
             if mode == "r+":
                 # Read-modify-write: what is written is uploaded on close.
                 with raw:
-                    return _AzWriteStream(self, initial=raw)
+                    return _AZWriteStream(self, initial=raw)
             if buffering == 0:
                 return raw
             size = _io.DEFAULT_BUFFER_SIZE if buffering in (-1, 1) else buffering
@@ -481,28 +354,28 @@ class AzPath(_store.ObjectStorePath):
             raise IsADirectoryError(_errno.EISDIR, "Is a directory", str(self))
         if mode == "w" and self._holds_keys(self.key):
             raise IsADirectoryError(_errno.EISDIR, "Is a directory", str(self))
-        return _AzWriteStream(self, exclusive=(mode == "x"))
+        return _AZWriteStream(self, exclusive=(mode == "x"))
 
     def _upload_file(self, file, size: int, *, exclusive=False) -> None:
         """Upload the `size` bytes of `file` as the blob: one request while it
         fits in memory, else in blocks."""
-        if size <= _store.SPOOL_SIZE:
+        if size <= SPOOL_SIZE:
             self._upload(file.read(), exclusive=exclusive)
             return
         blob_client = self._container.get_blob_client(self.key)
-        with _translate_errors(self, create=exclusive):
+        with translate_errors(self, create=exclusive):
             blob_client.upload_blob(_ReadOnly(file), overwrite=not exclusive)
 
     def _upload(self, data: bytes, *, key=None, exclusive=False) -> None:
         blob_client = self._container.get_blob_client(self.key if key is None else key)
-        with _translate_errors(self, create=exclusive):
+        with translate_errors(self, create=exclusive):
             # overwrite=False sends If-None-Match: *, so a concurrent creator
             # makes this fail (409), never silently overwritten.
             blob_client.upload_blob(data, overwrite=not exclusive)
 
     def _flat_entries(self, prefix: str) -> "list[tuple[str, int]]":
         """`(name, size)` of every blob under `prefix`, with no delimiter."""
-        with _translate_errors(self):
+        with translate_errors(self):
             return [
                 (blob.name, blob.size or 0)
                 for blob in self._container.list_blobs(name_starts_with=prefix)
@@ -511,7 +384,7 @@ class AzPath(_store.ObjectStorePath):
     def _delete_each(self, keys, on_error, *, ignore_missing=False):
         for key in keys:
             try:
-                with _translate_errors(self._key_path(key)):
+                with translate_errors(self._key_path(key)):
                     self._container.get_blob_client(key).delete_blob()
             except Exception as error:
                 if ignore_missing and isinstance(error, FileNotFoundError):
@@ -519,14 +392,6 @@ class AzPath(_store.ObjectStorePath):
                     continue
                 if not on_error(error, self._key_path(key)):
                     raise
-
-    def _same_location(self, other: Uri) -> bool:
-        # The authority is the storage account; a rename is a blob copy
-        # within one container, so the container must match too.
-        if not super()._same_location(other):
-            return False
-        other_container = next((s for s in other.path.split("/") if s), "")
-        return other_container == self.container
 
     @staticmethod
     def _abort_copy(blob_client, copy_id) -> None:
@@ -538,17 +403,13 @@ class AzPath(_store.ObjectStorePath):
                 pass
 
     def _stat_root(self) -> FileStat:
-        # A container root (or `az://account`): ask the server, as s3: does with
-        # HeadBucket, so a mistyped name does not read as an existing directory. A
-        # one-item listing needs only the permission the rest of the path uses.
-        with _translate_errors(self):
-            if self.container:
-                listing = self._container.list_blobs(
-                    name_starts_with="", results_per_page=1
-                )
-            else:
-                listing = self._client.list_containers(results_per_page=1)
-            for _ in listing:
+        # Ask the server, as S3Path does with HeadBucket, so a mistyped name
+        # does not read as an existing directory. A one-item listing needs only
+        # the permission the rest of the path uses.
+        with translate_errors(self):
+            for _ in self._container.list_blobs(
+                name_starts_with="", results_per_page=1
+            ):
                 break
         return FileStat(is_dir=True)
 
@@ -581,7 +442,7 @@ class AzPath(_store.ObjectStorePath):
         return self._properties(key) is not None
 
     def _has_prefix(self, key: str) -> bool:
-        with _translate_errors(self):
+        with translate_errors(self):
             # One item answers; the default page would carry up to 5000.
             for _ in self._container.list_blobs(
                 name_starts_with=f"{key}/", results_per_page=1
@@ -590,7 +451,7 @@ class AzPath(_store.ObjectStorePath):
         return False
 
     def _first_keys(self, prefix: str, limit: int) -> "list[str]":
-        with _translate_errors(self):
+        with translate_errors(self):
             return [
                 blob.name
                 for blob in _itertools.islice(
@@ -607,7 +468,7 @@ class AzPath(_store.ObjectStorePath):
     def _delete_object(self, key: str, *, missing_ok: bool) -> None:
         blob_client = self._container.get_blob_client(key)
         try:
-            with _translate_errors(self):
+            with translate_errors(self):
                 blob_client.delete_blob()
         except FileNotFoundError:
             # Deleted since the caller looked. Anything else -- a lease, a
@@ -634,15 +495,10 @@ class AzPath(_store.ObjectStorePath):
 
         self._delete_each(keys, on_error)
 
-    def _rename_dest(self, target) -> "AzPath":
-        # `with_path`, not `with_segments(target)`: the latter joined the Uri
-        # object itself as a segment and raised TypeError for every str target.
-        return target if isinstance(target, AzPath) else self.with_path(target.path)
-
     def _rename_source(self, key: str):
         return self._properties(key)
 
-    def _copy_blob(self, dest: "AzPath", dest_key: str) -> None:
+    def _copy_blob(self, dest: "AZPath", dest_key: str) -> None:
         """Copy this blob onto `dest_key` of its container with the service's
         copy, waiting for it to finish; the destination holds the content when
         it returns."""
@@ -652,13 +508,14 @@ class AzPath(_store.ObjectStorePath):
         copy_props = dest_blob_client.start_copy_from_url(source_url)
         copy_id = _copy_id(copy_props)
         # Poll until copy is complete
-        deadline = _time.monotonic() + COPY_POLL_TIMEOUT
+        timeout = self._backend_setting("copy_timeout")
+        deadline = _time.monotonic() + timeout
         while _copy_status(copy_props) == "pending":
             if _time.monotonic() >= deadline:
                 self._abort_copy(dest_blob_client, copy_id)
                 raise TimeoutError(
                     _errno.ETIMEDOUT,
-                    f"the copy did not finish within {COPY_POLL_TIMEOUT:g} s",
+                    f"the copy did not finish within {timeout:g} s",
                     str(self),
                 )
             _time.sleep(_COPY_POLL_INTERVAL)
@@ -667,22 +524,22 @@ class AzPath(_store.ObjectStorePath):
         if _copy_status(copy_props) != "success":
             raise OSError(f"Copy failed: {self} -> {dest}")
 
-    def _rename_copy(self, props, dest: "AzPath", dest_key: str) -> None:
-        with _translate_errors(self):
+    def _rename_copy(self, props, dest: "AZPath", dest_key: str) -> None:
+        with translate_errors(self):
             self._copy_blob(dest, dest_key)
             self._container.get_blob_client(self.key).delete_blob()
 
     def _store_copy_possible(self, target) -> bool:
         # The service copies within one container, as rename() does.
-        return super()._store_copy_possible(target) and self._same_location(target)
+        return super()._store_copy_possible(target) and self._place == target._place
 
-    def _copy_object(self, target: "AzPath", size: int) -> bool:
+    def _copy_object(self, target: "AZPath", size: int) -> bool:
         try:
             self._copy_blob(target, target.key)
         except Exception as error:
-            if _http_status(error) == 501:
+            if http_status(error) == 501:
                 return False
-            translated = _oserror(error, self)
+            translated = oserror(error, self)
             if translated is None:
                 raise
             raise translated from None

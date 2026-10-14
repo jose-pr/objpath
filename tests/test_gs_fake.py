@@ -1,18 +1,42 @@
+"""`GSPath` and the `gs:` URI path against a fake `google.cloud.storage` client:
+the calls the paths make, the errors they raise for a reply or a transport
+failure, and what each operation costs in requests.
+
+Every test that takes `gs` runs once per `flavor`: on the `GSPath` of a bucket
+and on the `GSURIPath` of the same URL. A test that takes neither checks a
+backend or a module on its own."""
+
+from __future__ import annotations
+
 import datetime
+import errno
 import hashlib
+import sys
+import warnings
 
 import pytest
 
 import objstore_fakes
-from pathlib_next.uri.schemes import _objstore as store
-from pathlib_next.uri.schemes.gs import BaseGsBackend, GsPath
+from store_support import make_path
+
+with warnings.catch_warnings():
+    # `google-crc32c` warns on import where it has no compiled extension, and
+    # the fake blobs would first import it under the filters of a test.
+    warnings.simplefilter("ignore")
+    try:
+        import google_crc32c  # noqa: F401
+    except ImportError:
+        pass
+
+from objpath import _gs, _reader, _writer  # noqa: E402
+from objpath import BaseGSBackend, GSBackend, GSPath  # noqa: E402
+from objpath.exceptions import ObjectChangedError, UnreachableKeysError  # noqa: E402
 
 
 class _ApiError(Exception):
     """Mirrors `google.api_core.exceptions.GoogleAPICallError`: the HTTP
     status is the `code` attribute (`NotFound.code == 404`), which is what
-    `GsPath` classifies by. The real types cannot be raised here -- the SDK
-    is not installed in the test venvs."""
+    `GSPath` classifies by."""
 
     code = None
 
@@ -268,7 +292,7 @@ class _FakeClient:
         return _FakeBatch(self.bucket_obj, raise_exception)
 
 
-class _FakeBackend(BaseGsBackend):
+class _FakeBackend(BaseGSBackend):
     def __init__(self, batching=False):
         self.client_obj = _FakeClient(batching)
 
@@ -276,21 +300,28 @@ class _FakeBackend(BaseGsBackend):
         return self.client_obj
 
 
-def _gs(uri, backend=None):
-    return GsPath(uri, backend=backend or _FakeBackend())
+@pytest.fixture
+def gs(flavor):
+    """Builds the path a URL names, of the class under test, on `backend`
+    (a new `_FakeBackend` when none is given)."""
+
+    def build(url, backend=None):
+        return make_path(flavor, url, backend=backend or _FakeBackend())
+
+    return build
 
 
-def test_stat_and_listing_report_the_updated_time_as_an_epoch():
+def test_stat_and_listing_report_the_updated_time_as_an_epoch(gs):
     # `Blob.updated` is a timezone-aware UTC datetime.
     backend = _FakeBackend()
     backend.client_obj.bucket_obj.objects["dir/a.txt"] = b"abc"
-    assert _gs("gs://bucket/dir/a.txt", backend).stat().st_mtime == 1767268800
-    entries = dict(_gs("gs://bucket/dir", backend)._scandir())
+    assert gs("gs://bucket/dir/a.txt", backend).stat().st_mtime == 1767268800
+    entries = dict(gs("gs://bucket/dir", backend)._scandir())
     assert entries["a.txt"].st_mtime == 1767268800
     assert entries["a.txt"].st_size == 3
 
 
-def test_rm_recursive_deletes_prefix_tree():
+def test_rm_recursive_deletes_prefix_tree(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update(
@@ -301,12 +332,12 @@ def test_rm_recursive_deletes_prefix_tree():
             "other.txt": b"keep",
         }
     )
-    _gs("gs://bucket/dir", backend).rm(recursive=True)
+    gs("gs://bucket/dir", backend).rm(recursive=True)
     assert bucket.objects == {"other.txt": b"keep"}
     assert bucket.list_calls == ["dir/"]
 
 
-def test_rm_recursive_deletes_exact_object_before_prefix():
+def test_rm_recursive_deletes_exact_object_before_prefix(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update(
@@ -315,7 +346,7 @@ def test_rm_recursive_deletes_exact_object_before_prefix():
             "file.txt/nested.txt": b"keep",
         }
     )
-    _gs("gs://bucket/file.txt", backend).rm(recursive=True)
+    gs("gs://bucket/file.txt", backend).rm(recursive=True)
     assert bucket.objects == {"file.txt/nested.txt": b"keep"}
     assert bucket.list_calls == []
 
@@ -328,20 +359,20 @@ def _batching_bucket(count=0, **objects):
     return backend, bucket
 
 
-def test_rm_recursive_deletes_a_prefix_in_batches_of_one_hundred():
+def test_rm_recursive_deletes_a_prefix_in_batches_of_one_hundred(gs):
     backend, bucket = _batching_bucket(250, **{"other.txt": b"keep"})
-    _gs("gs://bucket/dir", backend).rm(recursive=True)
+    gs("gs://bucket/dir", backend).rm(recursive=True)
     assert bucket.objects == {"other.txt": b"keep"}
     assert [len(names) for names in bucket.batch_calls] == [100, 100, 50]
     assert bucket.batch_calls[0][0] == "dir/f000"
     assert bucket.batch_calls[2][-1] == "dir/f249"
 
 
-def test_rm_recursive_offers_each_refused_key_once_with_its_own_path():
+def test_rm_recursive_offers_each_refused_key_once_with_its_own_path(gs):
     backend, bucket = _batching_bucket(5)
     bucket.batch_statuses["dir/f002"] = 403
     offered = []
-    _gs("gs://bucket/dir", backend).rm(
+    gs("gs://bucket/dir", backend).rm(
         recursive=True,
         ignore_error=lambda error, path: offered.append((type(error), path.key))
         or True,
@@ -351,75 +382,75 @@ def test_rm_recursive_offers_each_refused_key_once_with_its_own_path():
     assert len(bucket.batch_calls) == 1
 
 
-def test_rm_recursive_raises_the_first_refused_key_when_it_is_not_ignored():
+def test_rm_recursive_raises_the_first_refused_key_when_it_is_not_ignored(gs):
     backend, bucket = _batching_bucket(3)
     bucket.batch_statuses["dir/f001"] = 500
     with pytest.raises(OSError) as info:
-        _gs("gs://bucket/dir", backend).rm(recursive=True)
+        gs("gs://bucket/dir", backend).rm(recursive=True)
     assert type(info.value) is OSError
     assert info.value.filename == "gs://bucket/dir/f001"
     assert "refused" in str(info.value)
 
 
-def test_rm_recursive_does_not_offer_a_blob_that_is_already_gone():
+def test_rm_recursive_does_not_offer_a_blob_that_is_already_gone(gs):
     backend, bucket = _batching_bucket(3)
     bucket.batch_statuses["dir/f001"] = 404
     offered = []
-    _gs("gs://bucket/dir", backend).rm(
+    gs("gs://bucket/dir", backend).rm(
         recursive=True, ignore_error=lambda error, path: offered.append(path) or True
     )
     assert offered == []
 
 
-def test_rm_recursive_deletes_each_key_when_the_batch_request_fails():
+def test_rm_recursive_deletes_each_key_when_the_batch_request_fails(gs):
     backend, bucket = _batching_bucket(4)
     bucket.batch_rejected = True
-    _gs("gs://bucket/dir", backend).rm(recursive=True)
+    gs("gs://bucket/dir", backend).rm(recursive=True)
     assert bucket.objects == {}
     assert len(bucket.batch_calls) == 1
 
 
-def test_rm_recursive_deletes_each_key_when_the_replies_do_not_match_the_keys():
+def test_rm_recursive_deletes_each_key_when_the_replies_do_not_match_the_keys(gs):
     backend, bucket = _batching_bucket(4)
     bucket.batch_short = True
-    _gs("gs://bucket/dir", backend).rm(recursive=True)
+    gs("gs://bucket/dir", backend).rm(recursive=True)
     assert bucket.objects == {}
 
 
-def test_rm_recursive_missing_ok():
-    _gs("gs://bucket/missing", _FakeBackend()).rm(recursive=True, missing_ok=True)
+def test_rm_recursive_missing_ok(gs):
+    gs("gs://bucket/missing", _FakeBackend()).rm(recursive=True, missing_ok=True)
 
 
-def test_rm_recursive_missing_without_missing_ok_raises():
+def test_rm_recursive_missing_without_missing_ok_raises(gs):
     with pytest.raises(FileNotFoundError):
-        _gs("gs://bucket/missing", _FakeBackend()).rm(recursive=True)
+        gs("gs://bucket/missing", _FakeBackend()).rm(recursive=True)
 
 
-def test_rm_recursive_ignore_error_swallows_missing():
+def test_rm_recursive_ignore_error_swallows_missing(gs):
     calls = []
-    _gs("gs://bucket/missing", _FakeBackend()).rm(
+    gs("gs://bucket/missing", _FakeBackend()).rm(
         recursive=True,
         ignore_error=lambda err, path: calls.append((type(err), path.key)) or True,
     )
     assert calls == [(FileNotFoundError, "missing")]
 
 
-def test_rm_recursive_root_guard():
+def test_rm_recursive_root_guard(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects["a.txt"] = b"x"
     with pytest.raises(PermissionError):
-        _gs("gs://bucket/", backend).rm(recursive=True)
+        gs("gs://bucket/", backend).rm(recursive=True)
     assert bucket.objects == {"a.txt": b"x"}
 
 
-def test_rm_recursive_delete_error_reroutes_to_ignore_error():
+def test_rm_recursive_delete_error_reroutes_to_ignore_error(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects["dir/a.txt"] = b"x"
     bucket.delete_errors.add("dir/a.txt")
     calls = []
-    _gs("gs://bucket/dir", backend).rm(
+    gs("gs://bucket/dir", backend).rm(
         recursive=True,
         ignore_error=lambda err, path: calls.append((type(err), path.key)) or True,
     )
@@ -429,42 +460,27 @@ def test_rm_recursive_delete_error_reroutes_to_ignore_error():
 # --- a trailing "/" names the directory, not the "dir/" marker object -------
 
 
-@pytest.mark.parametrize(
-    "uri, key",
-    [
-        ("gs://bucket/dir/", "dir"),
-        ("gs://bucket/dir", "dir"),
-        ("gs://bucket/", ""),
-        ("gs://bucket/a//b", "a//b"),
-        ("gs://bucket/dir//", "dir/"),
-    ],
-)
-def test_key_drops_one_trailing_slash(uri, key):
-    assert _gs(uri).key == key
-
-
-def test_trailing_slash_marker_dir_is_a_directory_and_rm_deletes_tree():
+def test_trailing_slash_marker_dir_is_a_directory_and_rm_deletes_tree(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update(
         {"dir/": b"", "dir/a.txt": b"a", "dir/sub/b.txt": b"b", "other.txt": b"k"}
     )
-    p = _gs("gs://bucket/dir/", backend)
+    p = gs("gs://bucket/dir/", backend)
     assert p.is_dir()
     assert not p.is_file()
     p.rm(recursive=True)
     assert bucket.objects == {"other.txt": b"k"}
 
 
-# --- GsBackend passes client options through, never touching os.environ ----
+# --- GSBackend passes client options through, never touching os.environ ----
 
 
 @pytest.fixture
 def fake_storage_module(monkeypatch):
     """A stand-in `google.cloud.storage` that records the Client kwargs, so
-    the backend is checked without the SDK installed."""
+    a backend builds its client without the SDK making one."""
     import importlib
-    import sys
     import types
 
     received = []
@@ -488,14 +504,12 @@ def fake_storage_module(monkeypatch):
 def test_gs_backend_does_not_mutate_environment(fake_storage_module, monkeypatch):
     import os
 
-    from pathlib_next.uri.schemes.gs import GsBackend
-
     monkeypatch.delenv("STORAGE_EMULATOR_HOST", raising=False)
     options = {
         "api_endpoint": "https://storage-acme.p.googleapis.com",
         "quota_project_id": "billing-proj",
     }
-    GsBackend(client_options=options, project="prod").client()
+    GSBackend(client_options=options, project="prod").client()
     assert "STORAGE_EMULATOR_HOST" not in os.environ
     # Every option reaches the client, api_endpoint included.
     assert fake_storage_module == [
@@ -509,17 +523,30 @@ def test_gs_backend_does_not_mutate_environment(fake_storage_module, monkeypatch
     ]
 
     # A later, unrelated backend is not redirected.
-    GsBackend(project="unrelated").client()
+    GSBackend(project="unrelated").client()
     assert "STORAGE_EMULATOR_HOST" not in os.environ
     assert fake_storage_module[-1] == {"project": "unrelated"}
 
 
 def test_gs_backend_caches_its_client(fake_storage_module):
-    from pathlib_next.uri.schemes.gs import GsBackend
-
-    backend = GsBackend(project="p")
+    backend = GSBackend(project="p")
     assert backend.client() is backend.client()
     assert len(fake_storage_module) == 1
+
+
+def test_gs_backend_close_closes_its_client_and_the_next_call_builds_another(
+    fake_storage_module,
+):
+    closed = []
+    sys.modules["google.cloud.storage"].Client.close = lambda self: closed.append(self)
+    with GSBackend(project="p") as backend:
+        first = backend.client()
+    assert closed == [first]
+    backend.close()  # harmless twice
+    assert closed == [first]
+    second = backend.client()
+    assert second is not first
+    assert len(fake_storage_module) == 2
 
 
 # --- only a not-found reply means "missing" ---------------------------------
@@ -532,10 +559,10 @@ def _bucket_with(**objects):
     return backend, bucket
 
 
-def test_transient_reload_error_is_not_file_not_found():
+def test_transient_reload_error_is_not_file_not_found(gs):
     backend, bucket = _bucket_with(**{"report.csv": b"PRECIOUS"})
     bucket.reload_errors["report.csv"] = _ServiceUnavailable("503 backend error")
-    p = _gs("gs://bucket/report.csv", backend)
+    p = gs("gs://bucket/report.csv", backend)
     with pytest.raises(OSError) as info:
         p.stat()
     assert not isinstance(info.value, FileNotFoundError)
@@ -543,27 +570,27 @@ def test_transient_reload_error_is_not_file_not_found():
     assert bucket.objects == {"report.csv": b"PRECIOUS"}
 
 
-def test_forbidden_reload_is_permission_error():
+def test_forbidden_reload_is_permission_error(gs):
     backend, bucket = _bucket_with(**{"a.txt": b"x"})
     bucket.reload_errors["a.txt"] = _Forbidden("403")
-    p = _gs("gs://bucket/a.txt", backend)
+    p = gs("gs://bucket/a.txt", backend)
     with pytest.raises(PermissionError):
         p.stat()
     assert not p.exists()  # pathlib parity: exists() swallows OSError
 
 
-def test_rm_recursive_transient_reload_error_does_not_delete_prefix_tree():
+def test_rm_recursive_transient_reload_error_does_not_delete_prefix_tree(gs):
     backend, bucket = _bucket_with(**{"x": b"object", "x/child": b"child"})
     bucket.reload_errors["x"] = _ServiceUnavailable("503")
     with pytest.raises(OSError):
-        _gs("gs://bucket/x", backend).rm(recursive=True)
+        gs("gs://bucket/x", backend).rm(recursive=True)
     assert bucket.objects == {"x": b"object", "x/child": b"child"}
 
 
-def test_unlink_missing_ok_does_not_hide_a_failed_delete():
+def test_unlink_missing_ok_does_not_hide_a_failed_delete(gs):
     backend, bucket = _bucket_with(**{"held.txt": b"x"})
     bucket.delete_raises["held.txt"] = _Forbidden("403 object under hold")
-    p = _gs("gs://bucket/held.txt", backend)
+    p = gs("gs://bucket/held.txt", backend)
     with pytest.raises(PermissionError):
         p.unlink(missing_ok=True)
     with pytest.raises(PermissionError):
@@ -571,63 +598,58 @@ def test_unlink_missing_ok_does_not_hide_a_failed_delete():
     assert "held.txt" in bucket.objects
 
 
-def test_missing_sdk_is_import_error_not_file_not_found():
-    try:
-        import google.cloud.storage  # noqa: F401
-    except ImportError:
-        pass
-    else:
-        pytest.skip("google-cloud-storage is installed")
-    p = GsPath("gs://bucket/a.txt")
-    with pytest.raises(ImportError):
-        p.read_bytes()
-    with pytest.raises(ImportError):
-        p.exists()
+def test_missing_sdk_is_import_error_not_file_not_found(flavor, monkeypatch):
+    # `None` in `sys.modules` makes the import of the SDK fail as if it were
+    # not installed.
+    monkeypatch.setitem(sys.modules, "google.cloud.storage", None)
+    p = make_path(flavor, "gs://bucket/a.txt")
+    assert p.bucket == "bucket"
+    for use in (p.read_bytes, p.exists, p.stat, lambda: list(p.parent.iterdir())):
+        with pytest.raises(ImportError, match=r"objpath\[gs\]"):
+            use()
 
 
 # --- missing or wrong-type targets raise like pathlib ------------------------
 
 
-def test_iterdir_missing_and_file_raise():
+def test_iterdir_missing_and_file_raise(gs):
     backend, _bucket = _bucket_with(**{"file.txt": b"x", "d/": b""})
     with pytest.raises(FileNotFoundError):
-        list(_gs("gs://bucket/typo", backend).iterdir())
+        list(gs("gs://bucket/typo", backend).iterdir())
     with pytest.raises(NotADirectoryError):
-        list(_gs("gs://bucket/file.txt", backend).iterdir())
-    assert list(_gs("gs://bucket/d", backend).iterdir()) == []
+        list(gs("gs://bucket/file.txt", backend).iterdir())
+    assert list(gs("gs://bucket/d", backend).iterdir()) == []
 
 
-def test_unlink_directory_and_rmdir_wrong_targets():
-    import errno
-
+def test_unlink_directory_and_rmdir_wrong_targets(gs):
     backend, bucket = _bucket_with(**{"file.txt": b"x", "d/": b"", "d/f": b"y"})
     with pytest.raises(IsADirectoryError):
-        _gs("gs://bucket/d", backend).unlink()
+        gs("gs://bucket/d", backend).unlink()
     with pytest.raises(FileNotFoundError):
-        _gs("gs://bucket/nope", backend).rmdir()
+        gs("gs://bucket/nope", backend).rmdir()
     with pytest.raises(NotADirectoryError):
-        _gs("gs://bucket/file.txt", backend).rmdir()
+        gs("gs://bucket/file.txt", backend).rmdir()
     with pytest.raises(OSError) as info:
-        _gs("gs://bucket/d", backend).rmdir()
+        gs("gs://bucket/d", backend).rmdir()
     assert info.value.errno == errno.ENOTEMPTY
     assert set(bucket.objects) == {"file.txt", "d/", "d/f"}
 
 
-def test_read_directory_is_a_directory_error():
+def test_read_directory_is_a_directory_error(gs):
     backend, _bucket = _bucket_with(**{"d/f": b"y"})
     with pytest.raises(IsADirectoryError):
-        _gs("gs://bucket/d", backend).read_bytes()
+        gs("gs://bucket/d", backend).read_bytes()
 
 
 # --- write streams ----------------------------------------------------------
 
 
-def test_failed_close_upload_is_not_retried_at_gc():
+def test_failed_close_upload_is_not_retried_at_gc(gs):
     import gc
 
     backend, bucket = _bucket_with()
     bucket.upload_errors.append(_ServiceUnavailable("503"))
-    p = _gs("gs://bucket/state.json", backend)
+    p = gs("gs://bucket/state.json", backend)
     f = p.open("wb")
     f.write(b'{"version": 1}')
     with pytest.raises(OSError):
@@ -639,10 +661,10 @@ def test_failed_close_upload_is_not_retried_at_gc():
     assert bucket.objects["state.json"] == b'{"version": 2}'
 
 
-def test_exclusive_create_is_atomic():
+def test_exclusive_create_is_atomic(gs):
     backend, bucket = _bucket_with()
-    first = _gs("gs://bucket/job.lock", backend).open("xb")
-    second = _gs("gs://bucket/job.lock", backend).open("xb")
+    first = gs("gs://bucket/job.lock", backend).open("xb")
+    second = gs("gs://bucket/job.lock", backend).open("xb")
     first.write(b"worker1")
     second.write(b"worker2")
     first.close()
@@ -651,18 +673,18 @@ def test_exclusive_create_is_atomic():
     assert bucket.objects["job.lock"] == b"worker1"
 
 
-def test_mkdir_race_is_file_exists():
+def test_mkdir_race_is_file_exists(gs):
     backend, bucket = _bucket_with()
     bucket.upload_errors.append(_PreconditionFailed("412"))
     with pytest.raises(FileExistsError):
-        _gs("gs://bucket/d", backend).mkdir()
+        gs("gs://bucket/d", backend).mkdir()
 
 
-def test_rplus_writes_land_and_read_stream_is_read_only():
+def test_rplus_writes_land_and_read_stream_is_read_only(gs):
     import io
 
     backend, bucket = _bucket_with(**{"a.txt": b"hello"})
-    p = _gs("gs://bucket/a.txt", backend)
+    p = gs("gs://bucket/a.txt", backend)
     with p.open("rb") as f:
         with pytest.raises(io.UnsupportedOperation):
             f.write(b"x")
@@ -680,13 +702,15 @@ class _Abort(Exception):
 
 @pytest.mark.parametrize("spooled", [False, True], ids=["memory", "temp-file"])
 @pytest.mark.parametrize("mode, data", [("wb", b"part"), ("w", "part")])
-def test_a_write_block_that_raised_uploads_nothing(monkeypatch, mode, data, spooled):
+def test_a_write_block_that_raised_uploads_nothing(
+    gs, monkeypatch, mode, data, spooled
+):
     if spooled:
-        monkeypatch.setattr(store.SpoolUploadStream, "spool_size", 2)
+        monkeypatch.setattr(_writer.SpoolUploadStream, "spool_size", 2)
     backend, bucket = _bucket_with(**{"old": b"OLD"})
     for key in ("old", "new"):
         with pytest.raises(_Abort):
-            with _gs(f"gs://bucket/{key}", backend).open(mode) as f:
+            with gs(f"gs://bucket/{key}", backend).open(mode) as f:
                 f.write(data)
                 raise _Abort
     assert bucket.objects == {"old": b"OLD"}
@@ -694,31 +718,31 @@ def test_a_write_block_that_raised_uploads_nothing(monkeypatch, mode, data, spoo
 
 
 @pytest.mark.parametrize("mode, data", [("r+b", b"J"), ("r+", "J")])
-def test_a_read_modify_write_block_that_raised_uploads_nothing(mode, data):
+def test_a_read_modify_write_block_that_raised_uploads_nothing(gs, mode, data):
     backend, bucket = _bucket_with(**{"a.txt": b"hello"})
     with pytest.raises(_Abort):
-        with _gs("gs://bucket/a.txt", backend).open(mode) as f:
+        with gs("gs://bucket/a.txt", backend).open(mode) as f:
             f.write(data)
             raise _Abort
     assert bucket.objects == {"a.txt": b"hello"}
     assert bucket.uploads == []
 
 
-def test_an_exclusive_create_block_that_raised_uploads_nothing():
+def test_an_exclusive_create_block_that_raised_uploads_nothing(gs):
     backend, bucket = _bucket_with()
     with pytest.raises(_Abort):
-        with _gs("gs://bucket/job.lock", backend).open("xb") as f:
+        with gs("gs://bucket/job.lock", backend).open("xb") as f:
             f.write(b"worker1")
             raise _Abort
     assert bucket.objects == {} and bucket.uploads == []
 
 
 @pytest.mark.parametrize("mode, data", [("wb", b"whole"), ("w", "whole")])
-def test_a_write_block_that_ended_normally_or_was_closed_uploads_once(mode, data):
+def test_a_write_block_that_ended_normally_or_was_closed_uploads_once(gs, mode, data):
     backend, bucket = _bucket_with()
-    with _gs("gs://bucket/a", backend).open(mode) as f:
+    with gs("gs://bucket/a", backend).open(mode) as f:
         f.write(data)
-    f = _gs("gs://bucket/b", backend).open(mode)
+    f = gs("gs://bucket/b", backend).open(mode)
     f.write(data)
     f.close()
     f.close()
@@ -728,30 +752,55 @@ def test_a_write_block_that_ended_normally_or_was_closed_uploads_once(mode, data
 
 @pytest.mark.parametrize("mode, data", [("wb", b"whole"), ("w", "whole")])
 def test_an_upload_that_fails_after_a_normal_block_raises_once_and_is_not_retried(
-    mode, data
+    gs, mode, data
 ):
     import gc
 
     backend, bucket = _bucket_with()
     bucket.upload_errors.append(_ServiceUnavailable("503"))
     with pytest.raises(OSError):
-        with _gs("gs://bucket/state.json", backend).open(mode) as f:
+        with gs("gs://bucket/state.json", backend).open(mode) as f:
             f.write(data)
     gc.collect()
     assert bucket.objects == {} and bucket.uploads == []
 
 
+# --- a listed child carries the stat of its listing --------------------------
+
+
+def test_a_listed_child_answers_one_stat_from_its_listing_and_the_next_asks_the_store(
+    gs, monkeypatch
+):
+    reloads = []
+    original = _FakeBlob.reload
+
+    def counted(self, **kwargs):
+        reloads.append(self.name)
+        return original(self, **kwargs)
+
+    monkeypatch.setattr(_FakeBlob, "reload", counted)
+    backend, bucket = _bucket_with(**{"d/a.txt": b"abc", "d/sub/x": b"x"})
+    children = {child.name: child for child in gs("gs://bucket/d", backend).iterdir()}
+    assert sorted(children) == ["a.txt", "sub"]
+    assert reloads == [] and bucket.list_calls == ["d/"]
+    assert children["a.txt"].stat().st_size == 3
+    assert children["sub"].stat().is_dir()
+    assert reloads == [] and bucket.list_calls == ["d/"]
+    assert children["a.txt"].stat().st_size == 3
+    assert reloads == ["d/a.txt"]
+
+
 # --- rename/move of a prefix directory ---------------------------------------
 
 
-def test_rename_prefix_directory_falls_back_in_move():
+def test_rename_prefix_directory_falls_back_in_move(gs):
     backend, bucket = _bucket_with(**{"dir/a": b"a", "dir/sub/b": b"b", "k": b"k"})
-    src = _gs("gs://bucket/dir", backend)
+    src = gs("gs://bucket/dir", backend)
     with pytest.raises(NotImplementedError):
         src.rename("dir2")
     with pytest.raises(FileNotFoundError):
-        _gs("gs://bucket/nope", backend).rename("nope2")
-    src.move(_gs("gs://bucket/dir3", backend))
+        gs("gs://bucket/nope", backend).rename("nope2")
+    src.move(gs("gs://bucket/dir3", backend))
     # copy(recursive=True) creates the directories as markers.
     assert bucket.objects == {
         "dir3/": b"",
@@ -762,24 +811,24 @@ def test_rename_prefix_directory_falls_back_in_move():
     }
 
 
-# --- objstore-listing-hides-object-prefix-collision -----------------------------
+# --- a key that is both an object and a prefix ------------------------------
 
 
-def test_key_that_is_object_and_prefix_lists_as_the_object():
+def test_key_that_is_object_and_prefix_lists_as_the_object(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update(
         {"src/logs": b"FILE-CONTENT", "src/logs/2026.txt": b"child", "src/d/x": b"x"}
     )
-    listing = dict(_gs("gs://bucket/src", backend)._scandir())
+    listing = dict(gs("gs://bucket/src", backend)._scandir())
     assert sorted(listing) == ["d", "logs"]
     assert not listing["logs"].is_dir()
     assert listing["logs"].st_size == len(b"FILE-CONTENT")
     assert listing["d"].is_dir()
-    assert not _gs("gs://bucket/src/logs", backend).stat().is_dir()
+    assert not gs("gs://bucket/src/logs", backend).stat().is_dir()
 
 
-# --- objstore-gs-az-root-always-exists ------------------------------------------
+# --- the root of a bucket ----------------------------------------------------
 
 
 class _MissingBucket(_FakeBucket):
@@ -787,24 +836,24 @@ class _MissingBucket(_FakeBucket):
         raise _Missing("bucket not found")
 
 
-def test_missing_bucket_root_does_not_exist():
+def test_missing_bucket_root_does_not_exist(gs):
     backend = _FakeBackend()
     backend.client_obj.bucket_obj = _MissingBucket()
-    root = _gs("gs://typo-bucket/", backend)
+    root = gs("gs://typo-bucket/", backend)
     with pytest.raises(FileNotFoundError):
         root.stat()
     assert not root.exists()
     assert not root.is_dir()
 
 
-def test_existing_bucket_root_is_a_directory_even_when_empty():
+def test_existing_bucket_root_is_a_directory_even_when_empty(gs):
     backend = _FakeBackend()
-    root = _gs("gs://bucket", backend)
+    root = gs("gs://bucket", backend)
     assert root.stat().is_dir()
     assert backend.client_obj.bucket_obj.list_calls == [""]
 
 
-def test_bucket_root_permission_error_is_not_a_directory():
+def test_bucket_root_permission_error_is_not_a_directory(gs):
     class _Forbidding(_FakeBucket):
         def list_blobs(self, prefix="", delimiter=None, **_kwargs):
             raise _Forbidden("no list permission")
@@ -812,13 +861,13 @@ def test_bucket_root_permission_error_is_not_a_directory():
     backend = _FakeBackend()
     backend.client_obj.bucket_obj = _Forbidding()
     with pytest.raises(PermissionError):
-        _gs("gs://bucket/", backend).stat()
+        gs("gs://bucket/", backend).stat()
 
 
 # --- a listed name is one component inside the directory that listed it ------
 
 
-def test_listing_skips_names_that_are_not_one_component():
+def test_listing_skips_names_that_are_not_one_component(gs):
     backend = _FakeBackend()
     backend.client_obj.bucket_obj.objects.update(
         {
@@ -830,7 +879,7 @@ def test_listing_skips_names_that_are_not_one_component():
             "dir/sub/f": b"x",
         }
     )
-    listing = dict(_gs("gs://bucket/dir", backend)._scandir())
+    listing = dict(gs("gs://bucket/dir", backend)._scandir())
     assert sorted(listing) == ["ok.txt", "sub"]
     assert listing["sub"].is_dir()
 
@@ -843,7 +892,7 @@ class _RawListing(list):
         self.prefixes = prefixes
 
 
-def test_listing_skips_names_a_server_reports_with_a_separator():
+def test_listing_skips_names_a_server_reports_with_a_separator(gs):
     class _Raw(_FakeBucket):
         def list_blobs(self, prefix="", delimiter=None, **_kwargs):
             blobs = [_FakeBlob(self, name) for name in ("dir/ok.txt", "dir/a/b")]
@@ -852,7 +901,7 @@ def test_listing_skips_names_a_server_reports_with_a_separator():
 
     backend = _FakeBackend()
     backend.client_obj.bucket_obj = _Raw()
-    listing = dict(_gs("gs://bucket/dir", backend)._scandir())
+    listing = dict(gs("gs://bucket/dir", backend)._scandir())
     assert sorted(listing) == ["ok.txt", "sub"]
 
 
@@ -880,65 +929,66 @@ def odd_prefix(request):
     return backend, bucket, dict(bucket.objects)
 
 
-def test_rm_recursive_of_a_prefix_with_hidden_objects_removes_none(odd_prefix):
+def test_rm_recursive_of_a_prefix_with_hidden_objects_removes_none(gs, odd_prefix):
     backend, bucket, before = odd_prefix
-    with pytest.raises(OSError, match="nothing was changed"):
-        _gs("gs://bucket/d", backend).rm(recursive=True)
+    with pytest.raises(UnreachableKeysError, match="nothing was changed"):
+        gs("gs://bucket/d", backend).rm(recursive=True)
     assert bucket.objects == before
     assert bucket.deleted == []
 
 
-def test_copy_recursive_of_a_prefix_with_hidden_objects_is_refused(odd_prefix):
+def test_copy_recursive_of_a_prefix_with_hidden_objects_is_refused(gs, odd_prefix):
     from pathlib_next.mempath import MemPath
 
     backend, bucket, before = odd_prefix
     target = MemPath("/copied")
-    with pytest.raises(OSError, match="nothing was changed"):
-        _gs("gs://bucket/d", backend).copy(target, recursive=True)
+    with pytest.raises(UnreachableKeysError, match="nothing was changed"):
+        gs("gs://bucket/d", backend).copy(target, recursive=True)
     assert not target.exists()
     assert bucket.objects == before
 
 
-def test_move_of_a_prefix_with_hidden_objects_keeps_every_object(odd_prefix):
+def test_move_of_a_prefix_with_hidden_objects_keeps_every_object(gs, odd_prefix):
     backend, bucket, before = odd_prefix
-    with pytest.raises(OSError, match="nothing was changed"):
-        _gs("gs://bucket/d", backend).move(_gs("gs://bucket/moved", backend))
+    with pytest.raises(UnreachableKeysError, match="nothing was changed"):
+        gs("gs://bucket/d", backend).move(gs("gs://bucket/moved", backend))
     assert bucket.objects == before
 
 
-def test_the_refusal_names_the_objects_a_listing_does_not_show():
+def test_the_refusal_names_the_objects_a_listing_does_not_show(gs):
     backend = _FakeBackend()
     backend.client_obj.bucket_obj.objects.update(
         {"d/x.txt": b"x", "d//y.txt": b"y", "d/logs": b"l", "d/logs/2026.txt": b"c"}
     )
-    with pytest.raises(OSError) as raised:
-        _gs("gs://bucket/d", backend).rm(recursive=True)
+    with pytest.raises(UnreachableKeysError) as raised:
+        gs("gs://bucket/d", backend).rm(recursive=True)
+    assert raised.value.errno == errno.EINVAL
     assert "'d//y.txt'" in str(raised.value)
     assert "'d/logs/2026.txt'" in str(raised.value)
     assert "'d/x.txt'" not in str(raised.value)
 
 
-def test_rm_recursive_with_ignore_error_removes_only_the_objects_a_listing_shows():
+def test_rm_recursive_with_ignore_error_removes_only_the_objects_a_listing_shows(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update(
         {"d/": b"", "d/x.txt": b"x", "d//y.txt": b"y", "d/logs": b"l", "d/logs/z": b"z"}
     )
     seen = []
-    _gs("gs://bucket/d", backend).rm(
+    gs("gs://bucket/d", backend).rm(
         recursive=True, ignore_error=lambda err, path: seen.append(err) or True
     )
     assert len(seen) == 1 and "'d//y.txt'" in str(seen[0])
     assert sorted(bucket.objects) == ["d//y.txt", "d/logs/z"]
 
 
-def test_move_of_a_prefix_a_listing_shows_moves_every_object():
+def test_move_of_a_prefix_a_listing_shows_moves_every_object(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update(
         {"d/": b"", "d/x.txt": b"x", "d/sub/a.txt": b"a", "d/empty/": b""}
     )
-    _gs("gs://bucket/d", backend).move(_gs("gs://bucket/moved", backend))
+    gs("gs://bucket/d", backend).move(gs("gs://bucket/moved", backend))
     assert sorted(bucket.objects) == [
         "moved/",
         "moved/empty/",
@@ -951,36 +1001,36 @@ def test_move_of_a_prefix_a_listing_shows_moves_every_object():
 # --- a write or rename never turns a prefix directory into an object ----------
 
 
-def test_write_onto_a_prefix_directory_is_refused():
+def test_write_onto_a_prefix_directory_is_refused(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update({"d/": b"", "d/x.txt": b"x"})
     with pytest.raises(IsADirectoryError):
-        _gs("gs://bucket/d", backend).write_bytes(b"clobber")
+        gs("gs://bucket/d", backend).write_bytes(b"clobber")
     assert bucket.objects == {"d/": b"", "d/x.txt": b"x"}
     assert bucket.uploads == []
 
 
-def test_rename_onto_a_prefix_directory_is_refused():
+def test_rename_onto_a_prefix_directory_is_refused(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update({"b.txt": b"b", "dst/keep.txt": b"k"})
     with pytest.raises(IsADirectoryError):
-        _gs("gs://bucket/b.txt", backend).rename("dst")
+        gs("gs://bucket/b.txt", backend).rename("dst")
     assert bucket.objects == {"b.txt": b"b", "dst/keep.txt": b"k"}
 
 
-def test_write_and_rename_onto_an_object_still_replace_it():
+def test_write_and_rename_onto_an_object_still_replace_it(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update({"a.txt": b"a", "b.txt": b"b"})
-    _gs("gs://bucket/a.txt", backend).write_bytes(b"new")
+    gs("gs://bucket/a.txt", backend).write_bytes(b"new")
     assert bucket.objects["a.txt"] == b"new"
-    _gs("gs://bucket/b.txt", backend).rename("a.txt")
+    gs("gs://bucket/b.txt", backend).rename("a.txt")
     assert bucket.objects == {"a.txt": b"b"}
 
 
-def test_write_where_the_prefix_cannot_be_listed_still_writes():
+def test_write_where_the_prefix_cannot_be_listed_still_writes(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
 
@@ -988,43 +1038,43 @@ def test_write_where_the_prefix_cannot_be_listed_still_writes():
         raise _Forbidden("403 list denied")
 
     bucket.list_blobs = denied
-    _gs("gs://bucket/w.txt", backend).write_bytes(b"written")
+    gs("gs://bucket/w.txt", backend).write_bytes(b"written")
     assert bucket.objects == {"w.txt": b"written"}
 
 
 # --- mkdir treats only "not found" as absent ------------------------------------
 
 
-def test_mkdir_does_not_create_a_marker_when_the_probe_fails():
+def test_mkdir_does_not_create_a_marker_when_the_probe_fails(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects["existing.txt"] = b"keep"
     bucket.reload_errors["existing.txt"] = _ServiceUnavailable("503")
     with pytest.raises(OSError) as raised:
-        _gs("gs://bucket/existing.txt", backend).mkdir()
+        gs("gs://bucket/existing.txt", backend).mkdir()
     assert not isinstance(raised.value, FileExistsError)
     assert bucket.objects == {"existing.txt": b"keep"}
     assert bucket.uploads == []
 
 
-def test_mkdir_on_an_object_is_file_exists_and_on_a_missing_path_writes_the_marker():
+def test_mkdir_on_an_object_is_file_exists_and_on_a_missing_path_writes_the_marker(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects["existing.txt"] = b"keep"
     with pytest.raises(FileExistsError):
-        _gs("gs://bucket/existing.txt", backend).mkdir()
-    _gs("gs://bucket/newdir", backend).mkdir()
+        gs("gs://bucket/existing.txt", backend).mkdir()
+    gs("gs://bucket/newdir", backend).mkdir()
     assert sorted(bucket.objects) == ["existing.txt", "newdir/"]
 
 
 # --- removing a bucket is not supported ----------------------------------------
 
 
-def test_rmdir_of_the_bucket_root_is_refused():
+def test_rmdir_of_the_bucket_root_is_refused(gs):
     backend = _FakeBackend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects["a.txt"] = b"x"
-    root = _gs("gs://bucket/", backend)
+    root = gs("gs://bucket/", backend)
     with pytest.raises(PermissionError):
         root.rmdir()
     with pytest.raises(PermissionError):
@@ -1040,18 +1090,18 @@ class _GatewayTimeout(_ApiError):  # DeadlineExceeded
     code = 504
 
 
-def _get_failure(error):
+def _get_failure(gs, error):
     backend, bucket = _bucket_with(**{"a.txt": b"x"})
     bucket.reload_errors["a.txt"] = error
-    return _gs("gs://bucket/a.txt", backend)
+    return gs("gs://bucket/a.txt", backend)
 
 
-def test_a_connection_failure_is_a_connection_error_naming_the_path():
+def test_a_connection_failure_is_a_connection_error_naming_the_path(gs):
     requests_exc = pytest.importorskip("requests.exceptions")
     error = requests_exc.ConnectionError(
         "Max retries: /o/a.txt?X-Goog-Signature=SECRET"
     )
-    path = _get_failure(error)
+    path = _get_failure(gs, error)
     with pytest.raises(ConnectionError) as info:
         path.stat()
     assert not isinstance(info.value, TimeoutError)
@@ -1062,17 +1112,17 @@ def test_a_connection_failure_is_a_connection_error_naming_the_path():
 
 
 @pytest.mark.parametrize("name", ["ReadTimeout", "ConnectTimeout"])
-def test_a_timeout_of_the_http_client_is_a_timeout_error(name):
+def test_a_timeout_of_the_http_client_is_a_timeout_error(gs, name):
     requests_exc = pytest.importorskip("requests.exceptions")
-    path = _get_failure(getattr(requests_exc, name)("slow"))
+    path = _get_failure(gs, getattr(requests_exc, name)("slow"))
     with pytest.raises(TimeoutError) as info:
         path.stat()
     assert info.value.filename == "gs://bucket/a.txt"
     assert info.value.__cause__ is None
 
 
-def test_a_gateway_timeout_reply_is_a_timeout_error():
-    path = _get_failure(_GatewayTimeout("504"))
+def test_a_gateway_timeout_reply_is_a_timeout_error(gs):
+    path = _get_failure(gs, _GatewayTimeout("504"))
     with pytest.raises(TimeoutError):
         path.stat()
 
@@ -1087,7 +1137,7 @@ def test_a_gateway_timeout_reply_is_a_timeout_error():
     ],
 )
 def test_a_retry_that_ran_out_of_time_reports_what_the_last_attempt_failed_with(
-    cause, expected
+    gs, cause, expected
 ):
     requests_exc = pytest.importorskip("requests.exceptions")
     api_exc = pytest.importorskip("google.api_core.exceptions")
@@ -1097,7 +1147,7 @@ def test_a_retry_that_ran_out_of_time_reports_what_the_last_attempt_failed_with(
         "unavailable": _ServiceUnavailable("503"),
         None: None,
     }[cause]
-    path = _get_failure(api_exc.RetryError("Timeout of 120.0s exceeded", last))
+    path = _get_failure(gs, api_exc.RetryError("Timeout of 120.0s exceeded", last))
     with pytest.raises(expected) as info:
         path.stat()
     if expected is OSError:
@@ -1106,7 +1156,7 @@ def test_a_retry_that_ran_out_of_time_reports_what_the_last_attempt_failed_with(
     assert path.exists() is False
 
 
-def test_a_body_cut_short_is_a_connection_reset_naming_the_path(monkeypatch):
+def test_a_body_cut_short_is_a_connection_reset_naming_the_path(gs, monkeypatch):
     requests_exc = pytest.importorskip("requests.exceptions")
     backend, bucket = _bucket_with(**{"a.txt": b"x"})
 
@@ -1115,13 +1165,13 @@ def test_a_body_cut_short_is_a_connection_reset_naming_the_path(monkeypatch):
 
     monkeypatch.setattr(_FakeBlob, "download_as_bytes", cut)
     with pytest.raises(ConnectionResetError) as info:
-        _gs("gs://bucket/a.txt", backend).read_bytes()
+        gs("gs://bucket/a.txt", backend).read_bytes()
     assert info.value.filename == "gs://bucket/a.txt"
     assert info.value.__cause__ is None
 
 
-def test_other_exceptions_still_propagate_as_themselves():
-    path = _get_failure(KeyError("a bug"))
+def test_other_exceptions_still_propagate_as_themselves(gs):
+    path = _get_failure(gs, KeyError("a bug"))
     with pytest.raises(KeyError):
         path.stat()
 
@@ -1149,7 +1199,7 @@ def _record_sdk_calls(monkeypatch):
     return seen
 
 
-def test_the_backend_timeout_and_retry_reach_every_sdk_call(monkeypatch):
+def test_the_backend_timeout_and_retry_reach_every_sdk_call(gs, monkeypatch):
     class Backend(_FakeBackend):
         def call_options(self):
             return {"timeout": 7, "retry": None}
@@ -1158,7 +1208,7 @@ def test_the_backend_timeout_and_retry_reach_every_sdk_call(monkeypatch):
     backend = Backend()
     bucket = backend.client_obj.bucket_obj
     bucket.objects.update({"d/a.txt": b"a", "d/b.txt": b"b", "f.txt": b"f"})
-    root = _gs("gs://bucket/", backend)
+    root = gs("gs://bucket/", backend)
     (root / "f.txt").stat()
     (root / "d").stat()
     list((root / "d").iterdir())
@@ -1180,32 +1230,30 @@ def test_the_backend_timeout_and_retry_reach_every_sdk_call(monkeypatch):
     assert all(options == {"timeout": 7, "retry": None} for _, options in seen)
 
 
-def test_a_backend_without_options_adds_no_keyword_to_a_call(monkeypatch):
+def test_a_backend_without_options_adds_no_keyword_to_a_call(gs, monkeypatch):
     seen = _record_sdk_calls(monkeypatch)
     backend, _bucket = _bucket_with(**{"f.txt": b"f"})
-    _gs("gs://bucket/f.txt", backend).stat()
+    gs("gs://bucket/f.txt", backend).stat()
     assert seen and all(options == {} for _, options in seen)
 
 
 def test_gs_backend_carries_timeout_and_retry_apart_from_the_client_kwargs(
     fake_storage_module,
 ):
-    from pathlib_next.uri.schemes.gs import GsBackend
-
-    backend = GsBackend(project="p", timeout=(3, 9), retry=None)
+    backend = GSBackend(project="p", timeout=(3, 9), retry=None)
     assert backend.call_options() == {"timeout": (3, 9), "retry": None}
     backend.client()
     assert fake_storage_module == [{"project": "p"}]
-    assert GsBackend(timeout=5).call_options() == {"timeout": 5}
-    assert GsBackend().call_options() == {}
+    assert GSBackend(timeout=5).call_options() == {"timeout": 5}
+    assert GSBackend().call_options() == {}
 
 
 # --- paths that name no object --------------------------------------------------
 
 
-def test_a_bucket_root_is_a_directory_to_read_or_write():
+def test_a_bucket_root_is_a_directory_to_read_or_write(gs):
     backend, bucket = _bucket_with(**{"a.txt": b"x"})
-    root = _gs("gs://bucket/", backend)
+    root = gs("gs://bucket/", backend)
     with pytest.raises(IsADirectoryError):
         root.read_bytes()
     with pytest.raises(IsADirectoryError):
@@ -1216,28 +1264,14 @@ def test_a_bucket_root_is_a_directory_to_read_or_write():
     assert bucket.objects == {"a.txt": b"x"}
 
 
-@pytest.mark.parametrize("uri", ["gs:x", "gs:///x", "gs:///"])
-def test_a_path_without_a_bucket_does_not_exist_and_asks_nothing(uri):
-    backend, bucket = _bucket_with(**{"x": b"x"})
-    path = _gs(uri, backend)
-    assert path.exists() is False
-    with pytest.raises(FileNotFoundError):
-        path.stat()
-    with pytest.raises(FileNotFoundError):
-        path.read_bytes()
-    with pytest.raises(FileNotFoundError):
-        path.write_bytes(b"x")
-    assert bucket.list_calls == [] and bucket.uploads == []
-
-
-def test_removing_a_missing_bucket_with_missing_ok_is_not_an_error():
+def test_removing_a_missing_bucket_with_missing_ok_is_not_an_error(gs):
     backend, bucket = _bucket_with()
 
     def missing(prefix="", **_kwargs):
         raise _Missing("The specified bucket does not exist")
 
     bucket.list_blobs = missing
-    path = _gs("gs://nobucket/x", backend)
+    path = gs("gs://nobucket/x", backend)
     assert path.rm(recursive=True, missing_ok=True) is None
     with pytest.raises(FileNotFoundError):
         path.rm(recursive=True)
@@ -1249,17 +1283,17 @@ def test_removing_a_missing_bucket_with_missing_ok_is_not_an_error():
     assert offered == [FileNotFoundError]
 
 
-def test_renaming_a_missing_path_onto_its_own_name_is_file_not_found():
+def test_renaming_a_missing_path_onto_its_own_name_is_file_not_found(gs):
     backend, bucket = _bucket_with(**{"there.txt": b"x", "d/f": b"x"})
     with pytest.raises(FileNotFoundError):
-        _gs("gs://bucket/nope", backend).rename("nope")
-    there = _gs("gs://bucket/there.txt", backend)
+        gs("gs://bucket/nope", backend).rename("nope")
+    there = gs("gs://bucket/there.txt", backend)
     assert there.rename("there.txt") == there
-    assert _gs("gs://bucket/d", backend).rename("d").key == "d"
+    assert gs("gs://bucket/d", backend).rename("d").key == "d"
     assert bucket.objects == {"there.txt": b"x", "d/f": b"x"}
 
 
-def test_renaming_a_prefix_directory_reloads_the_key_once(monkeypatch):
+def test_renaming_a_prefix_directory_reloads_the_key_once(gs, monkeypatch):
     reloads = []
     original = _FakeBlob.reload
 
@@ -1270,7 +1304,7 @@ def test_renaming_a_prefix_directory_reloads_the_key_once(monkeypatch):
     monkeypatch.setattr(_FakeBlob, "reload", counted)
     backend, bucket = _bucket_with(**{"dir/f": b"x"})
     with pytest.raises(NotImplementedError):
-        _gs("gs://bucket/dir", backend).rename("other")
+        gs("gs://bucket/dir", backend).rename("other")
     assert reloads == ["dir"]
     assert bucket.list_calls == ["dir/"]
 
@@ -1282,9 +1316,9 @@ def test_the_crc32c_the_fakes_report_is_the_castagnoli_check_value():
     assert objstore_fakes.crc32c(b"123456789") == 0xE3069283
 
 
-def test_checksum_is_the_md5_or_crc32c_the_store_keeps_and_reads_no_byte():
+def test_checksum_is_the_md5_or_crc32c_the_store_keeps_and_reads_no_byte(gs):
     backend, bucket = _bucket_with(**{"a.bin": b"content"})
-    path = _gs("gs://bucket/a.bin", backend)
+    path = gs("gs://bucket/a.bin", backend)
     assert path.checksum() == hashlib.md5(b"content").hexdigest()
     assert path.checksum("MD5") == hashlib.md5(b"content").hexdigest()
     assert path.checksum("crc32c") == "%08x" % objstore_fakes.crc32c(b"content")
@@ -1292,59 +1326,59 @@ def test_checksum_is_the_md5_or_crc32c_the_store_keeps_and_reads_no_byte():
     assert bucket.downloads == []
 
 
-def test_checksum_of_a_composite_object_has_no_md5_but_has_its_crc32c():
+def test_checksum_of_a_composite_object_has_no_md5_but_has_its_crc32c(gs):
     backend, bucket = _bucket_with(**{"composed": b"abcdef"})
     bucket.stored["composed"] = {"md5_hash": None}
-    path = _gs("gs://bucket/composed", backend)
+    path = gs("gs://bucket/composed", backend)
     with pytest.raises(NotImplementedError):
         path.checksum("md5")
     assert path.checksum("crc32c") == "%08x" % objstore_fakes.crc32c(b"abcdef")
 
 
-def test_checksum_of_an_object_with_a_content_encoding_is_refused():
+def test_checksum_of_an_object_with_a_content_encoding_is_refused(gs):
     # The service reads such an object back decoded: the stored bytes' digests
     # are not those of the content.
     backend, bucket = _bucket_with(**{"z.gz": b"\x1f\x8b-compressed"})
     bucket.stored["z.gz"] = {"content_encoding": "gzip"}
-    path = _gs("gs://bucket/z.gz", backend)
+    path = gs("gs://bucket/z.gz", backend)
     for algorithm in ("md5", "crc32c"):
         with pytest.raises(NotImplementedError):
             path.checksum(algorithm)
 
 
-def test_checksum_refuses_an_algorithm_the_store_does_not_keep():
+def test_checksum_refuses_an_algorithm_the_store_does_not_keep(gs):
     backend, _bucket = _bucket_with(**{"a.bin": b"content"})
     with pytest.raises(NotImplementedError):
-        _gs("gs://bucket/a.bin", backend).checksum("sha256")
+        gs("gs://bucket/a.bin", backend).checksum("sha256")
 
 
-def test_checksum_of_a_missing_path_a_directory_and_the_bucket():
+def test_checksum_of_a_missing_path_a_directory_and_the_bucket(gs):
     backend, _bucket = _bucket_with(**{"d/a.txt": b"x"})
     with pytest.raises(FileNotFoundError):
-        _gs("gs://bucket/nothing", backend).checksum()
+        gs("gs://bucket/nothing", backend).checksum()
     with pytest.raises(IsADirectoryError):
-        _gs("gs://bucket/d", backend).checksum()
+        gs("gs://bucket/d", backend).checksum()
     with pytest.raises(IsADirectoryError):
-        _gs("gs://bucket", backend).checksum()
+        gs("gs://bucket", backend).checksum()
 
 
 # --- copy(): one copy call in the store -------------------------------------
 
 
-def test_copy_of_a_file_is_one_copy_call_and_reads_nothing():
+def test_copy_of_a_file_is_one_copy_call_and_reads_nothing(gs):
     backend, bucket = _bucket_with(**{"a.txt": b"content"})
-    _gs("gs://bucket/a.txt", backend).copy(_gs("gs://bucket/b.txt", backend))
+    gs("gs://bucket/a.txt", backend).copy(gs("gs://bucket/b.txt", backend))
     assert bucket.objects["b.txt"] == b"content"
     assert bucket.copies == [("a.txt", "b.txt")]
     assert bucket.downloads == [] and bucket.uploads == []
 
 
-def test_copy_reports_progress_once_with_the_total():
+def test_copy_reports_progress_once_with_the_total(gs):
     backend, _bucket = _bucket_with(**{"a.txt": b"content", "empty": b""})
     calls = []
     for name, size in (("a.txt", 7), ("empty", 0)):
-        _gs(f"gs://bucket/{name}", backend).copy(
-            _gs(f"gs://bucket/copy-{name}", backend),
+        gs(f"gs://bucket/{name}", backend).copy(
+            gs(f"gs://bucket/copy-{name}", backend),
             progress=lambda path, copied, total: calls.append(
                 (path.key, copied, total)
             ),
@@ -1353,11 +1387,9 @@ def test_copy_reports_progress_once_with_the_total():
         del calls[:]
 
 
-def test_copy_onto_an_existing_object_needs_overwrite_and_deletes_nothing_first():
+def test_copy_onto_an_existing_object_needs_overwrite_and_deletes_nothing_first(gs):
     backend, bucket = _bucket_with(**{"a.txt": b"new", "b.txt": b"old"})
-    source, target = _gs("gs://bucket/a.txt", backend), _gs(
-        "gs://bucket/b.txt", backend
-    )
+    source, target = gs("gs://bucket/a.txt", backend), gs("gs://bucket/b.txt", backend)
     with pytest.raises(FileExistsError):
         source.copy(target)
     assert bucket.copies == [] and bucket.objects["b.txt"] == b"old"
@@ -1366,51 +1398,106 @@ def test_copy_onto_an_existing_object_needs_overwrite_and_deletes_nothing_first(
     assert bucket.copies == [("a.txt", "b.txt")] and bucket.deleted == []
 
 
-def test_copy_onto_itself_or_a_prefix_directory_is_refused_before_the_store_is_asked():
-    import errno
-
+def test_copy_onto_itself_or_a_prefix_directory_is_refused_before_the_store_is_asked(
+    gs,
+):
     backend, bucket = _bucket_with(**{"a.txt": b"keep", "d/inner": b"inner"})
-    source = _gs("gs://bucket/a.txt", backend)
+    source = gs("gs://bucket/a.txt", backend)
     for overwrite in (False, True):
         with pytest.raises(OSError, match="same file") as info:
-            source.copy(_gs("gs://bucket/a.txt", backend), overwrite=overwrite)
+            source.copy(gs("gs://bucket/a.txt", backend), overwrite=overwrite)
         assert info.value.errno == errno.EINVAL
         with pytest.raises(IsADirectoryError):
-            source.copy(_gs("gs://bucket/d", backend), overwrite=overwrite)
+            source.copy(gs("gs://bucket/d", backend), overwrite=overwrite)
     assert bucket.copies == []
     assert set(bucket.objects) == {"a.txt", "d/inner"}
 
 
-def test_a_refused_copy_leaves_an_existing_target_as_it_was():
+def test_a_refused_copy_leaves_an_existing_target_as_it_was(gs):
     backend, bucket = _bucket_with(**{"a.txt": b"new", "b.txt": b"old"})
     bucket.copy_errors["a.txt"] = _Forbidden("403")
     with pytest.raises(PermissionError) as info:
-        _gs("gs://bucket/a.txt", backend).copy(
-            _gs("gs://bucket/b.txt", backend), overwrite=True
+        gs("gs://bucket/a.txt", backend).copy(
+            gs("gs://bucket/b.txt", backend), overwrite=True
         )
     assert info.value.filename == "gs://bucket/a.txt"
     assert bucket.objects["b.txt"] == b"old" and bucket.deleted == []
 
 
-def test_a_store_that_does_not_implement_the_copy_is_read_and_written_instead():
+def test_a_store_that_does_not_implement_the_copy_is_read_and_written_instead(gs):
     backend, bucket = _bucket_with(**{"a.txt": b"content"})
     bucket.copy_errors["a.txt"] = _NotImplemented("501")
-    _gs("gs://bucket/a.txt", backend).copy(_gs("gs://bucket/b.txt", backend))
+    gs("gs://bucket/a.txt", backend).copy(gs("gs://bucket/b.txt", backend))
     assert bucket.objects["b.txt"] == b"content"
     assert bucket.downloads == ["a.txt"] and bucket.uploads == ["b.txt"]
 
 
-def test_copy_between_two_supplied_backends_streams():
+def test_copy_between_two_supplied_backends_streams(gs):
     first, bucket = _bucket_with(**{"a.txt": b"content"})
     second = _FakeBackend()
-    _gs("gs://bucket/a.txt", first).copy(_gs("gs://bucket/b.txt", second))
+    gs("gs://bucket/a.txt", first).copy(gs("gs://bucket/b.txt", second))
     assert second.client_obj.bucket_obj.objects == {"b.txt": b"content"}
     assert bucket.copies == [] and bucket.downloads == ["a.txt"]
 
 
-def test_moving_a_prefix_copies_each_object_in_the_store():
+class _Buckets(_FakeClient):
+    """A client whose buckets are told apart by name."""
+
+    def __init__(self):
+        super().__init__()
+        self.named = {}
+
+    def bucket(self, name):
+        return self.named.setdefault(name, _FakeBucket())
+
+
+def _two_buckets():
+    """A backend whose client has the buckets `one` and `two`, and the two."""
+    backend = _FakeBackend()
+    backend.client_obj = _Buckets()
+    return backend, backend.client_obj.bucket("one"), backend.client_obj.bucket("two")
+
+
+def test_copy_between_two_buckets_of_one_backend_is_one_copy_call(gs):
+    backend, one, two = _two_buckets()
+    one.objects["a.txt"] = b"content"
+    gs("gs://one/a.txt", backend).copy(gs("gs://two/b.txt", backend))
+    assert two.objects == {"b.txt": b"content"}
+    assert one.copies == [("a.txt", "b.txt")]
+    assert one.downloads == [] and one.uploads == [] and two.uploads == []
+
+
+def test_rename_onto_another_bucket_is_not_implemented_and_move_copies_in_the_store(
+    gs,
+):
+    backend, one, two = _two_buckets()
+    one.objects["a.txt"] = b"content"
+    source, target = gs("gs://one/a.txt", backend), gs("gs://two/a.txt", backend)
+    with pytest.raises(NotImplementedError):
+        source.rename(target)
+    assert one.objects == {"a.txt": b"content"} and two.objects == {}
+    source.move(target)
+    assert one.objects == {} and two.objects == {"a.txt": b"content"}
+    assert one.copies == [("a.txt", "a.txt")]
+    assert one.downloads == []
+
+
+def test_rename_onto_another_backend_is_not_implemented_and_move_streams(gs):
+    first, bucket = _bucket_with(**{"a.txt": b"content"})
+    second = _FakeBackend()
+    source, target = gs("gs://bucket/a.txt", first), gs("gs://bucket/a.txt", second)
+    with pytest.raises(NotImplementedError):
+        source.rename(target)
+    assert bucket.objects == {"a.txt": b"content"}
+    assert second.client_obj.bucket_obj.objects == {}
+    source.move(target)
+    assert bucket.objects == {} and bucket.copies == []
+    assert second.client_obj.bucket_obj.objects == {"a.txt": b"content"}
+
+
+def test_moving_a_prefix_copies_each_object_in_the_store(gs):
     backend, bucket = _bucket_with(**{"d/a": b"a", "d/sub/b": b"b"})
-    _gs("gs://bucket/d", backend).move(_gs("gs://bucket/e", backend))
+    gs("gs://bucket/d", backend).move(gs("gs://bucket/e", backend))
     assert sorted(name for name in bucket.objects if not name.endswith("/")) == [
         "e/a",
         "e/sub/b",
@@ -1422,18 +1509,24 @@ def test_moving_a_prefix_copies_each_object_in_the_store():
 # --- reads and writes stream ------------------------------------------------
 
 
-def test_open_reads_the_object_in_ranges_of_one_chunk(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def _read_chunk(monkeypatch, size):
+    """A ranged read asks for `size` bytes at a time: the first request is
+    made by the path, the following ones by the reader."""
+    monkeypatch.setattr(_reader, "READ_CHUNK", size)
+
+
+def test_open_reads_the_object_in_ranges_of_one_chunk(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, bucket = _bucket_with(**{"big.bin": bytes(range(10))})
-    with _gs("gs://bucket/big.bin", backend).open("rb") as stream:
+    with gs("gs://bucket/big.bin", backend).open("rb") as stream:
         assert stream.read() == bytes(range(10))
     assert bucket.ranges == [("big.bin", 0, 3), ("big.bin", 4, 7), ("big.bin", 8, 11)]
 
 
-def test_a_stream_of_a_large_object_seeks_by_range(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def test_a_stream_of_a_large_object_seeks_by_range(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, bucket = _bucket_with(**{"big.bin": bytes(range(10))})
-    with _gs("gs://bucket/big.bin", backend).open("rb") as stream:
+    with gs("gs://bucket/big.bin", backend).open("rb") as stream:
         assert stream.seekable()
         stream.seek(6)
         assert stream.read(2) == bytes([6, 7])
@@ -1443,18 +1536,18 @@ def test_a_stream_of_a_large_object_seeks_by_range(monkeypatch):
         assert stream.read(1) == bytes([1])
 
 
-def test_open_reads_an_empty_object_and_text(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def test_open_reads_an_empty_object_and_text(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, _bucket = _bucket_with(
         **{"empty": b"", "t.txt": "héllo\nworld\n".encode()}
     )
-    assert _gs("gs://bucket/empty", backend).read_bytes() == b""
-    text = _gs("gs://bucket/t.txt", backend).read_text(encoding="utf-8")
+    assert gs("gs://bucket/empty", backend).read_bytes() == b""
+    text = gs("gs://bucket/t.txt", backend).read_text(encoding="utf-8")
     assert text == "héllo\nworld\n"
 
 
-def test_a_range_that_fails_midway_is_an_oserror(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def test_a_range_that_fails_midway_is_an_oserror(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, _bucket = _bucket_with(**{"big.bin": bytes(range(10))})
     original = _FakeBlob.download_as_bytes
 
@@ -1464,7 +1557,7 @@ def test_a_range_that_fails_midway_is_an_oserror(monkeypatch):
         return original(self, start, end, **kwargs)
 
     monkeypatch.setattr(_FakeBlob, "download_as_bytes", failing)
-    with _gs("gs://bucket/big.bin", backend).open("rb") as stream:
+    with gs("gs://bucket/big.bin", backend).open("rb") as stream:
         assert stream.read(4) == bytes(range(4))
         with pytest.raises(OSError) as info:
             stream.read(1)
@@ -1472,22 +1565,22 @@ def test_a_range_that_fails_midway_is_an_oserror(monkeypatch):
     assert info.value.__cause__ is None
 
 
-def test_r_plus_changes_an_object_that_spans_several_ranges(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def test_r_plus_changes_an_object_that_spans_several_ranges(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, bucket = _bucket_with(**{"big.bin": bytes(range(10))})
-    with _gs("gs://bucket/big.bin", backend).open("r+b") as stream:
+    with gs("gs://bucket/big.bin", backend).open("r+b") as stream:
         stream.seek(5)
         stream.write(b"\xff")
     assert bucket.objects["big.bin"] == bytes([0, 1, 2, 3, 4, 255, 6, 7, 8, 9])
 
 
 def test_a_write_that_fits_the_spool_is_one_request_and_a_larger_one_is_a_file(
-    monkeypatch,
+    gs, monkeypatch
 ):
-    monkeypatch.setattr(store, "SPOOL_SIZE", 8)
+    monkeypatch.setattr(_gs, "SPOOL_SIZE", 8)
     backend, bucket = _bucket_with()
-    _gs("gs://bucket/small", backend).write_bytes(b"12345678")
-    _gs("gs://bucket/large", backend).write_bytes(b"123456789")
+    gs("gs://bucket/small", backend).write_bytes(b"12345678")
+    gs("gs://bucket/large", backend).write_bytes(b"123456789")
     assert bucket.objects == {"small": b"12345678", "large": b"123456789"}
     assert bucket.uploads == ["small", "large"]
     assert bucket.file_uploads == [("large", 9)]
@@ -1496,68 +1589,28 @@ def test_a_write_that_fits_the_spool_is_one_request_and_a_larger_one_is_a_file(
 def test_a_large_exclusive_upload_does_not_replace_an_object(monkeypatch):
     import io
 
-    monkeypatch.setattr(store, "SPOOL_SIZE", 8)
+    monkeypatch.setattr(_gs, "SPOOL_SIZE", 8)
     backend, bucket = _bucket_with(**{"there": b"keep"})
+    path = GSPath("there", bucket="bucket", backend=backend)
     with pytest.raises(FileExistsError):
-        _gs("gs://bucket/there", backend)._upload_file(
-            io.BytesIO(b"123456789"), 9, exclusive=True
-        )
+        path._upload_file(io.BytesIO(b"123456789"), 9, exclusive=True)
     assert bucket.objects == {"there": b"keep"}
-    with _gs("gs://bucket/new", backend).open("xb") as stream:
+
+
+def test_a_large_exclusive_stream_creates_a_new_object_and_never_replaces(
+    gs, monkeypatch
+):
+    monkeypatch.setattr(_gs, "SPOOL_SIZE", 8)
+    backend, bucket = _bucket_with()
+    with gs("gs://bucket/new", backend).open("xb") as stream:
         stream.write(b"123456789")
     assert bucket.objects["new"] == b"123456789"
-
-
-# --- one default backend per process ----------------------------------------
-
-
-def test_separately_built_paths_share_one_default_client(fake_storage_module):
-    first, second = GsPath("gs://one/a.txt"), GsPath("gs://two/b.txt")
-    assert first.backend is second.backend
-    first.backend.client()
-    second.backend.client()
-    assert len(fake_storage_module) == 1
-
-
-def test_a_supplied_backend_is_not_the_shared_one():
-    from pathlib_next.uri.schemes.gs import GsBackend
-
-    own = GsBackend()
-    path = GsPath("gs://one/a.txt", backend=own)
-    assert path.backend is own
-    assert path.backend is not GsPath("gs://one/b.txt").backend
-    assert (path / "child").backend is own
-
-
-def test_threads_racing_for_the_default_backend_get_one():
-    import threading
-
-    found = []
-    barrier = threading.Barrier(8)
-
-    def build():
-        barrier.wait()
-        found.append(GsPath("gs://one/x").backend)
-
-    threads = [threading.Thread(target=build) for _ in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert len(found) == 8 and len({id(backend) for backend in found}) == 1
-
-
-def test_a_test_may_build_the_default_backend():
-    from pathlib_next.uri.schemes import gs
-
-    assert GsPath("gs://one/a.txt").backend is gs._DEFAULT_BACKEND
-
-
-def test_the_next_test_starts_without_the_default_backend_of_the_one_before():
-    # Follows the test above: the suite forgets the shared backend between tests.
-    from pathlib_next.uri.schemes import gs
-
-    assert gs._DEFAULT_BACKEND is None
+    late = gs("gs://bucket/late", backend).open("xb")
+    late.write(b"123456789")
+    bucket.objects["late"] = b"keep"
+    with pytest.raises(FileExistsError):
+        late.close()
+    assert bucket.objects["late"] == b"keep"
 
 
 # --- a read is one version of the object ------------------------------------
@@ -1580,18 +1633,16 @@ def _change_before_read(bucket, name, change, *, nth=2):
 
 
 def _stale_errno():
-    import errno
-
     return getattr(errno, "ESTALE", errno.EIO)
 
 
-def test_a_read_across_an_overwrite_raises_and_returns_no_mixed_bytes(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def test_a_read_across_an_overwrite_raises_and_returns_no_mixed_bytes(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, bucket = _bucket_with(**{"big.bin": OLD})
     _change_before_read(
         bucket, "big.bin", lambda: bucket.objects.update(**{"big.bin": NEW})
     )
-    path = _gs("gs://bucket/big.bin", backend)
+    path = gs("gs://bucket/big.bin", backend)
     got = []
     with path.open("rb") as stream:
         got.append(stream.read(4))
@@ -1599,6 +1650,7 @@ def test_a_read_across_an_overwrite_raises_and_returns_no_mixed_bytes(monkeypatc
             stream.read(4)
     assert got == [OLD[:4]]
     error = info.value
+    assert isinstance(error, ObjectChangedError)
     assert not isinstance(error, FileNotFoundError)
     assert error.errno == _stale_errno()
     assert "changed while it was being read" in error.strerror
@@ -1606,23 +1658,23 @@ def test_a_read_across_an_overwrite_raises_and_returns_no_mixed_bytes(monkeypatc
     assert error.__cause__ is None
 
 
-def test_a_read_of_an_object_deleted_midway_is_file_not_found(monkeypatch):
+def test_a_read_of_an_object_deleted_midway_is_file_not_found(gs, monkeypatch):
     for answers_412 in (False, True):
-        monkeypatch.setattr(store, "READ_CHUNK", 4)
+        _read_chunk(monkeypatch, 4)
         backend, bucket = _bucket_with(**{"big.bin": OLD})
         bucket.missing_is_412 = answers_412
         _change_before_read(bucket, "big.bin", lambda: bucket.objects.pop("big.bin"))
-        with _gs("gs://bucket/big.bin", backend).open("rb") as stream:
+        with gs("gs://bucket/big.bin", backend).open("rb") as stream:
             assert stream.read(4) == OLD[:4]
             with pytest.raises(FileNotFoundError):
                 stream.read(4)
 
 
-def test_a_read_pins_the_generation_of_its_first_request(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def test_a_read_pins_the_generation_of_its_first_request(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, bucket = _bucket_with(**{"big.bin": OLD})
     generation = bucket.objects.version("big.bin")
-    path = _gs("gs://bucket/big.bin", backend)
+    path = gs("gs://bucket/big.bin", backend)
     with path.open("rb") as stream:
         assert stream.read() == OLD
         stream.seek(5)
@@ -1634,10 +1686,10 @@ def test_a_read_pins_the_generation_of_its_first_request(monkeypatch):
     assert ("big.bin", 4, generation) in bucket.reads
 
 
-def test_two_opens_are_two_snapshots(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def test_two_opens_are_two_snapshots(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, bucket = _bucket_with(**{"big.bin": OLD})
-    path = _gs("gs://bucket/big.bin", backend)
+    path = gs("gs://bucket/big.bin", backend)
     with path.open("rb") as first:
         assert first.read(4) == OLD[:4]
         bucket.objects["big.bin"] = NEW
@@ -1645,11 +1697,12 @@ def test_two_opens_are_two_snapshots(monkeypatch):
             assert second.read() == NEW
         with pytest.raises(OSError) as info:
             first.read()
+    assert isinstance(info.value, ObjectChangedError)
     assert info.value.errno == _stale_errno()
 
 
-def test_seeking_to_the_end_asks_the_size_of_the_version_being_read(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def test_seeking_to_the_end_asks_the_size_of_the_version_being_read(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, bucket = _bucket_with(**{"big.bin": OLD})
     asked = []
     original = _FakeBlob.reload
@@ -1660,25 +1713,27 @@ def test_seeking_to_the_end_asks_the_size_of_the_version_being_read(monkeypatch)
 
     monkeypatch.setattr(_FakeBlob, "reload", recorded)
     generation = bucket.objects.version("big.bin")
-    with _gs("gs://bucket/big.bin", backend).open("rb") as stream:
+    with gs("gs://bucket/big.bin", backend).open("rb") as stream:
         stream.seek(-3, 2)
         assert stream.read() == OLD[-3:]
     assert asked == [generation]
     # An object replaced by a longer one is not measured as the one being read.
-    with _gs("gs://bucket/big.bin", backend).open("rb") as stream:
+    with gs("gs://bucket/big.bin", backend).open("rb") as stream:
         bucket.objects["big.bin"] = NEW + NEW
         with pytest.raises(OSError) as info:
             stream.seek(-3, 2)
+    assert isinstance(info.value, ObjectChangedError)
     assert info.value.errno == _stale_errno()
 
 
-def test_r_plus_reads_its_initial_content_as_one_version(monkeypatch):
-    monkeypatch.setattr(store, "READ_CHUNK", 4)
+def test_r_plus_reads_its_initial_content_as_one_version(gs, monkeypatch):
+    _read_chunk(monkeypatch, 4)
     backend, bucket = _bucket_with(**{"big.bin": OLD})
     _change_before_read(
         bucket, "big.bin", lambda: bucket.objects.update(**{"big.bin": NEW})
     )
     with pytest.raises(OSError) as info:
-        _gs("gs://bucket/big.bin", backend).open("r+b")
+        gs("gs://bucket/big.bin", backend).open("r+b")
+    assert isinstance(info.value, ObjectChangedError)
     assert info.value.errno == _stale_errno()
     assert bucket.objects["big.bin"] == NEW and bucket.uploads == []

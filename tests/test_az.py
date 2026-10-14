@@ -1,19 +1,23 @@
+"""`AZPath` and `AZURIPath` against the in-process fake of the Azure Blob
+Storage REST API: the SDK's real client talks to it over loopback, so what a
+test asserts on the server side is what the SDK sent. Every test that takes
+`az_server` runs for both classes."""
+
+
 import pytest
+from pathlib_next.testing import PathContract
 
 pytest.importorskip("azure.storage.blob")
 
-from pathlib_next.uri.schemes.az import AzPath, AzBackend
-from pathlib_next.uri import UriPath
-
-
-def test_az_path_registration():
-    """Test that az: scheme resolves to AzPath."""
-    path = UriPath("az://account/container/key/path", findclass=True)
-    assert isinstance(path, AzPath)
+from objpath import AZBackend
+from objpath import _az as az_module
+from objpath.exceptions import ObjectChangedError, UnreachableKeysError
+from store_support import make_path
 
 
 def test_az_path_components(az_server):
-    """Test that AzPath components are parsed correctly."""
+    """The account, the container and the key of the root of the fixture
+    container."""
     path, _ = az_server
     assert path.account == "testaccount"
     assert path.container == "testcontainer"
@@ -115,12 +119,12 @@ def test_az_prefix_with_a_hidden_subtree_is_not_copied_moved_or_removed(az_serve
     path, _ = az_server
     base = _blob_that_is_also_a_prefix(path)
     target = MemPath("/copied")
-    with pytest.raises(OSError, match="nothing was changed"):
+    with pytest.raises(UnreachableKeysError, match="nothing was changed"):
         base.copy(target, recursive=True)
     assert not target.exists()
-    with pytest.raises(OSError, match="nothing was changed"):
+    with pytest.raises(UnreachableKeysError, match="nothing was changed"):
         base.move(path / "moved")
-    with pytest.raises(OSError, match="nothing was changed"):
+    with pytest.raises(UnreachableKeysError, match="nothing was changed"):
         base.rm(recursive=True)
     assert (base / "logs" / "2026.txt").read_bytes() == b"child"
     assert (base / "d" / "x").read_bytes() == b"x"
@@ -141,32 +145,26 @@ def test_az_rmdir_of_the_container_root_is_refused(az_server):
     assert (path / "a.txt").exists()
 
 
-def _closed_port():
-    import socket
-
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def test_az_nothing_listening_is_a_connection_error_with_the_sas_token_unseen():
+def test_az_nothing_listening_is_a_connection_error_with_the_sas_token_unseen(
+    flavor, unused_tcp_port
+):
     # The SDK's own error is not an OSError, and its text names the URL.
     sas = "sv=2024-01-01&sp=r&sig=SECRETSIGNATUREVALUE"
-    backend = AzBackend(
-        account_url=f"http://127.0.0.1:{_closed_port()}/acct?{sas}",
+    with AZBackend(
+        account_url=f"http://127.0.0.1:{unused_tcp_port}/acct?{sas}",
         retry_total=0,
         # A refused loopback connection takes about two seconds to be
         # reported on Windows; a shorter timeout would be the error instead.
         connection_timeout=10,
-    )
-    path = AzPath("az://acct/container/blob.txt", backend=backend)
-    with pytest.raises(ConnectionError) as info:
-        path.stat()
-    assert not isinstance(info.value, TimeoutError)
-    assert info.value.filename == "az://acct/container/blob.txt"
-    assert info.value.__cause__ is None
-    assert "SECRETSIGNATUREVALUE" not in str(info.value)
-    assert path.exists() is False
+    ) as backend:
+        path = make_path(flavor, "az://acct/container/blob.txt", backend=backend)
+        with pytest.raises(ConnectionError) as info:
+            path.stat()
+        assert not isinstance(info.value, TimeoutError)
+        assert info.value.filename == "az://acct/container/blob.txt"
+        assert info.value.__cause__ is None
+        assert "SECRETSIGNATUREVALUE" not in str(info.value)
+        assert path.exists() is False
 
 
 @pytest.fixture
@@ -224,8 +222,11 @@ def test_az_a_listing_that_spans_pages_shows_every_entry_once(az_server, az_api_
     del state.requests[:]
     names = sorted(child.name for child in (path / "paged").iterdir())
     assert names == ["d0", "d1", "d2", "f0", "f1", "f2"]
-    assert len(_blob_list_requests(state)) >= 3
-    assert any("marker=" in target for target in _blob_list_requests(state))
+    # Six entries in pages of two: the first page asks for no marker, the
+    # next two continue from the one the previous page returned.
+    requests = _blob_list_requests(state)
+    assert len(requests) == 3
+    assert ["marker=" in target for target in requests] == [False, True, True]
 
 
 def test_az_removing_a_prefix_lists_every_page(az_server, az_api_server):
@@ -259,6 +260,7 @@ def test_az_a_refused_key_of_a_batch_is_offered_once_with_its_own_path(
     az_server, az_api_server
 ):
     path, _ = az_server
+    _base_url, account, container = az_api_server
     state = az_api_server.state
     for index in range(5):
         state.objects[f"bulk/f{index}"] = b"x"
@@ -269,7 +271,7 @@ def test_az_a_refused_key_of_a_batch_is_offered_once_with_its_own_path(
         ignore_error=lambda error, where: offered.append((type(error), str(where)))
         or True,
     )
-    assert offered == [(PermissionError, f"{path}/bulk/f3")]
+    assert offered == [(PermissionError, f"az://{account}/{container}/bulk/f3")]
     assert [name for name in state.objects if name.startswith("bulk/")] == ["bulk/f3"]
 
 
@@ -473,25 +475,34 @@ def test_az_a_stream_seeks_without_reading_what_it_skips(az_server, az_api_serve
     assert len(_content_reads(state)) == 3
 
 
-def test_az_an_exclusive_upload_does_not_replace_an_existing_blob(
+def test_az_an_exclusive_upload_does_not_replace_a_blob_created_meanwhile(
     az_server, az_api_server, monkeypatch
 ):
-    import io
-
-    from pathlib_next.uri.schemes import _objstore as store
-
     path, _ = az_server
     state = az_api_server.state
-    before = state.objects["a.txt"]
-    with pytest.raises(FileExistsError):
-        (path / "a.txt")._upload(b"new", exclusive=True)
     # Above the single-request size the upload is made of blocks.
-    monkeypatch.setattr(store, "SPOOL_SIZE", 8)
-    with pytest.raises(FileExistsError):
-        (path / "a.txt")._upload_file(io.BytesIO(b"123456789"), 9, exclusive=True)
-    assert state.objects["a.txt"] == before
-    (path / "fresh.txt")._upload_file(io.BytesIO(b"123456789"), 9, exclusive=True)
-    assert state.objects["fresh.txt"] == b"123456789"
+    monkeypatch.setattr(az_module, "SPOOL_SIZE", 8)
+    for size in (3, 9):
+        name = f"fresh{size}.txt"
+        stream = (path / name).open("xb")
+        stream.write(b"x" * size)
+        # Another writer creates the blob while the stream is open.
+        state.objects[name] = b"theirs"
+        with pytest.raises(FileExistsError):
+            stream.close()
+        assert state.objects[name] == b"theirs"
+
+
+def test_az_an_exclusive_upload_creates_a_blob_that_is_not_there(
+    az_server, az_api_server, monkeypatch
+):
+    path, _ = az_server
+    state = az_api_server.state
+    monkeypatch.setattr(az_module, "SPOOL_SIZE", 8)
+    for size in (3, 9):
+        with (path / f"created{size}.txt").open("xb") as stream:
+            stream.write(b"1" * size)
+        assert state.objects[f"created{size}.txt"] == b"1" * size
 
 
 # --- a read is one version of the blob --------------------------------------
@@ -521,15 +532,14 @@ def _change_on_second_read(state, name, change):
 
 @pytest.fixture
 def small_chunks(monkeypatch):
-    from pathlib_next.uri.schemes import az
-
-    monkeypatch.setattr(az, "READ_CHUNK", 16)
+    monkeypatch.setattr(AZBackend, "read_chunk", 16)
 
 
 def test_az_a_read_across_an_overwrite_raises_and_returns_no_mixed_bytes(
     az_server, az_api_server, small_chunks
 ):
     path, _ = az_server
+    _base_url, account, container = az_api_server
     state = az_api_server.state
     state.objects["pinned.bin"] = OLD
     _change_on_second_read(
@@ -538,14 +548,14 @@ def test_az_a_read_across_an_overwrite_raises_and_returns_no_mixed_bytes(
     got = []
     with (path / "pinned.bin").open("rb") as stream:
         got.append(stream.read(16))
-        with pytest.raises(OSError) as info:
+        with pytest.raises(ObjectChangedError) as info:
             stream.read(16)
     assert got == [OLD[:16]]
     error = info.value
     assert not isinstance(error, FileNotFoundError)
     assert error.errno == _stale_errno()
     assert "changed while it was being read" in error.strerror
-    assert error.filename == f"{path}/pinned.bin"
+    assert error.filename == f"az://{account}/{container}/pinned.bin"
     assert error.__cause__ is None
     assert state.objects["pinned.bin"] == NEW
 
@@ -602,3 +612,18 @@ def test_az_every_request_after_the_first_names_the_etag(
     with (path / "pinned.bin").open("rb") as stream:
         assert stream.read() == NEW
     assert state.reads[-1][2] == f'"{state.objects.version("pinned.bin")}"' != etag
+
+
+# --- the contract every Path meets, against the in-process Azure fake -----------
+
+
+class TestAZContract(PathContract):
+    # Directories are key prefixes and blobs are written whole.
+    enforces_directory_hierarchy = False
+    supports_append = False
+    supports_question_mark_names = True
+    supports_utime = False
+
+    @pytest.fixture
+    def root(self, az_server):
+        return az_server[0]

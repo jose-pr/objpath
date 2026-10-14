@@ -1,5 +1,5 @@
-"""The clients of the object-store backends: one per backend however many
-threads ask first, and none inside a pickled or copied backend or path."""
+"""The clients of the backends: one per backend however many threads ask first,
+none inside a pickled or copied backend or path, and one closed with its backend."""
 
 import copy
 import pickle
@@ -10,9 +10,8 @@ import types
 
 import pytest
 
-from pathlib_next.uri.schemes.az import AzBackend, AzPath
-from pathlib_next.uri.schemes.gs import GsBackend, GsPath
-from pathlib_next.uri.schemes.s3 import S3Backend, S3Path
+from objpath import AZBackend, GSBackend, S3Backend
+from store_support import make_path
 
 THREADS = 24
 
@@ -75,7 +74,7 @@ def test_threads_racing_for_a_fresh_s3_backend_build_one_client(monkeypatch):
 def test_threads_racing_for_a_fresh_gs_backend_build_one_client(monkeypatch):
     builds = _SlowBuilds()
     _install(monkeypatch, "google.cloud.storage", Client=builds)
-    got = _asked_at_once(GsBackend(project="p"))
+    got = _asked_at_once(GSBackend(project="p"))
     assert len(builds.built) == 1
     assert all(client is builds.built[0] for client in got)
 
@@ -83,13 +82,13 @@ def test_threads_racing_for_a_fresh_gs_backend_build_one_client(monkeypatch):
 def test_threads_racing_for_a_fresh_az_backend_build_one_client_and_credential(
     monkeypatch,
 ):
-    from pathlib_next.uri.schemes import az
+    from objpath import _az_backend
 
     credentials = _SlowBuilds()
-    monkeypatch.setattr(az, "_default_credential", credentials)
+    monkeypatch.setattr(_az_backend, "_default_credential", credentials)
     builds = _SlowBuilds()
     _install(monkeypatch, "azure.storage.blob", BlobServiceClient=builds)
-    got = _asked_at_once(AzBackend(account="acct"))
+    got = _asked_at_once(AZBackend(account="acct"))
     assert len(builds.built) == 1 and len(credentials.built) == 1
     assert all(client is builds.built[0] for client in got)
 
@@ -128,7 +127,7 @@ def test_an_s3_backend_pickles_and_copies_after_its_client_was_built():
 
 def test_a_gs_backend_pickles_and_copies_after_its_client_was_built():
     pytest.importorskip("google.cloud.storage")
-    backend = GsBackend(
+    backend = GSBackend(
         project="p",
         client_options={"api_endpoint": "http://127.0.0.1:9"},
         use_auth_w_custom_endpoint=False,
@@ -140,7 +139,7 @@ def test_a_gs_backend_pickles_and_copies_after_its_client_was_built():
 
 def test_an_az_backend_pickles_and_copies_after_its_client_was_built():
     pytest.importorskip("azure.storage.blob")
-    backend = AzBackend(
+    backend = AZBackend(
         account_url="https://acct.blob.core.windows.net/?sv=2024-01-01&sig=x",
         retry_total=1,
     )
@@ -177,12 +176,12 @@ def _secret_backend(scheme):
             aws_session_token=SECRETS[2].decode(),
         )
     if scheme == "gs":
-        return GsBackend(
+        return GSBackend(
             project=SECRETS[0].decode(),
             client_options={"quota_project_id": SECRETS[1].decode()},
             extra_headers={"x-token": SECRETS[2].decode()},
         )
-    return AzBackend(
+    return AZBackend(
         account_url=f"https://acct.blob.core.windows.net/?sig={SECRETS[1].decode()}",
         credential=SECRETS[2].decode(),
         connection_verify=SECRETS[0].decode(),
@@ -190,30 +189,30 @@ def _secret_backend(scheme):
 
 
 @pytest.mark.parametrize(
-    "scheme, uri, cls",
+    "scheme, uri",
     [
-        ("s3", "s3://bkt/a.txt", S3Path),
-        ("gs", "gs://bkt/a.txt", GsPath),
-        ("az", "az://acct/cont/a.txt", AzPath),
+        ("s3", "s3://bkt/a.txt"),
+        ("gs", "gs://bkt/a.txt"),
+        ("az", "az://acct/cont/a.txt"),
     ],
 )
-def test_a_pickled_path_carries_no_client_kwargs_and_no_client(scheme, uri, cls):
+def test_a_pickled_path_carries_no_client_kwargs_and_no_client(flavor, scheme, uri):
     backend = _secret_backend(scheme)
     assert not getattr(backend, "picklable", False)
-    path = cls(uri, backend=backend)
+    path = make_path(flavor, uri, backend=backend)
     data = pickle.dumps(path)
     for secret in SECRETS:
         assert secret not in data
     assert b"botocore" not in data and b"boto3" not in data
     assert b"google.cloud" not in data and b"azure.storage" not in data
     again = pickle.loads(data)
-    assert type(again) is cls and str(again) == uri
+    assert type(again) is type(path) and str(again) == uri
     # The receiving process builds the default backend, not this one.
     assert again.backend is not backend
     assert getattr(again.backend, "client_kwargs", {}) == {}
 
 
-def test_an_s3_path_pickles_and_deep_copies_after_it_did_io(monkeypatch):
+def test_an_s3_path_pickles_and_deep_copies_after_it_did_io(flavor, monkeypatch):
     pytest.importorskip("boto3")
     pytest.importorskip("moto")
     import boto3
@@ -230,7 +229,7 @@ def test_an_s3_path_pickles_and_deep_copies_after_it_did_io(monkeypatch):
             aws_secret_access_key=SECRETS[1].decode(),
             aws_session_token=SECRETS[2].decode(),
         )
-        path = S3Path("s3://bkt/dir/a.txt", backend=backend)
+        path = make_path(flavor, "s3://bkt/dir/a.txt", backend=backend)
         path.write_bytes(b"x")
         assert path.exists()
         children = list(path.parent.iterdir())
@@ -240,7 +239,83 @@ def test_an_s3_path_pickles_and_deep_copies_after_it_did_io(monkeypatch):
             assert str(pickle.loads(data)) == str(item)
             assert str(copy.deepcopy(item)) == str(item)
         # A path built for itself pickles after its first request, too.
-        derived = S3Path("s3://bkt/dir/a.txt")
+        derived = make_path(flavor, "s3://bkt/dir/a.txt")
         assert derived.read_bytes() == b"x"
         assert str(pickle.loads(pickle.dumps(derived))) == str(derived)
         assert copy.deepcopy(derived).read_bytes() == b"x"
+
+
+# --- a backend closes the client it built, and is a context manager --------------
+
+
+class _Closing:
+    """Stands for an SDK client that can be closed."""
+
+    def __init__(self):
+        self.closed = 0
+
+    def close(self):
+        self.closed += 1
+
+
+def _backend_building(monkeypatch, store):
+    """`(backend, built)`: a backend of `store` whose client is a `_Closing`
+    and the list of the clients it built."""
+    built = []
+
+    def build(*args, **kwargs):
+        client = _Closing()
+        built.append(client)
+        return client
+
+    if store == "s3":
+        boto3 = pytest.importorskip("boto3")
+        monkeypatch.setattr(boto3, "client", build)
+        return S3Backend(), built
+    if store == "gs":
+        _install(monkeypatch, "google.cloud.storage", Client=build)
+        return GSBackend(project="p"), built
+    _install(monkeypatch, "azure.storage.blob", BlobServiceClient=build)
+    return AZBackend(account_url="https://acct.blob.core.windows.net/"), built
+
+
+@pytest.mark.parametrize("store", ["s3", "gs", "az"])
+def test_closing_a_backend_closes_its_client_and_the_next_use_builds_another(
+    monkeypatch, store
+):
+    backend, built = _backend_building(monkeypatch, store)
+    first = backend.client()
+    backend.close()
+    assert first.closed == 1
+    backend.close()
+    assert first.closed == 1
+    second = backend.client()
+    assert second is not first and len(built) == 2 and second.closed == 0
+
+
+@pytest.mark.parametrize("store", ["s3", "gs", "az"])
+def test_leaving_a_with_block_closes_the_backend_and_returns_it(monkeypatch, store):
+    backend, built = _backend_building(monkeypatch, store)
+    with backend as entered:
+        assert entered is backend
+        client = backend.client()
+    assert client.closed == 1
+
+
+@pytest.mark.parametrize("store", ["s3", "gs", "az"])
+def test_closing_a_backend_that_never_built_a_client_does_nothing(monkeypatch, store):
+    backend, built = _backend_building(monkeypatch, store)
+    backend.close()
+    assert built == []
+
+
+def test_a_backend_of_your_own_is_a_context_manager_that_closes_nothing():
+    from objpath import BaseS3Backend
+
+    class Mine(BaseS3Backend):
+        def client(self):
+            return object()
+
+    with Mine() as backend:
+        assert backend.client() is not None
+    backend.close()

@@ -5,8 +5,8 @@ import os
 
 
 def test_a_clean_test():
-    assert "PATHLIB_NEXT_LEAKED" not in os.environ
+    assert "OBJPATH_LEAKED" not in os.environ
 
 
 def test_writes_the_environment():
-    os.environ["PATHLIB_NEXT_LEAKED"] = "yes"
+    os.environ["OBJPATH_LEAKED"] = "yes"

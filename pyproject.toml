@@ -97,5 +97,10 @@ target-version = ["py39"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-filterwarnings = ["error"]
+filterwarnings = [
+    "error",
+    # boto3 emits a Python 3.9 EOL notice warning; filter by module/message
+    # so pytest doesn't need boto3 importable just to parse the warning rule.
+    "ignore:.*Python 3\\.9.*:Warning:boto3(\\..*)?$",
+]
 xfail_strict = true

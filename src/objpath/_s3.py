@@ -4,85 +4,25 @@ import errno as _errno
 import io as _io
 import itertools as _itertools
 import re as _re
-import threading as _threading
 import typing as _ty
 
-from ... import providers as _providers
-from ... import FileStat
-from . import _objstore as _store
-from ._extras import import_client as _import_client
-from ._extras import import_or_stub as _import_or_stub
+from pathlib_next import FileStat
+from pathlib_next import providers as _providers
 
-try:
-    from boto3.exceptions import S3UploadFailedError as _S3UploadFailedError
-except ImportError:  # a botocore-only BaseS3Backend
-    _S3UploadFailedError = ()
-
-
-class BaseS3Backend(object):
-    """Protocol for obtaining a `boto3` S3 client. Subclass this to plug in
-    custom credential/session handling (e.g. tests mock it directly, no
-    real AWS account needed); `S3Backend` is the real implementation."""
-
-    # Weakly referenceable so `UriPath` can record which backends a path
-    # derived for itself (see `UriPath._supplied_backend()`).
-    __slots__ = ("__weakref__",)
-
-    @_providers.notimplemented
-    def client(self):
-        """The `boto3` S3 client every call of a path goes through."""
-
-
-class S3Backend(BaseS3Backend):
-    """Lazily creates+caches a `boto3` S3 client. Unlike `sftp.py`'s/
-    `ftp.py`'s per-thread connection pools, a single `boto3` client is
-    reused across threads -- it's documented as thread-safe."""
-
-    __slots__ = ("client_kwargs", "_client", "_client_lock")
-
-    def __init__(self, **client_kwargs):
-        self.client_kwargs = client_kwargs
-        self._client = None
-        self._client_lock = _threading.Lock()
-
-    def client(self):
-        return _store.lazy_client(self, self._build_client)
-
-    def _build_client(self):
-        boto3 = _import_client("boto3", "s3")
-        return boto3.client("s3", **self.client_kwargs)
-
-    # A pickled or copied backend keeps `client_kwargs` and builds its own
-    # client on first use; the client itself cannot be pickled or copied.
-    def __getstate__(self):
-        return _store.backend_state(self)
-
-    def __setstate__(self, state):
-        _store.restore_backend(self, state)
-
-
-_DEFAULT_BACKEND: "S3Backend | None" = None
-_DEFAULT_BACKEND_LOCK = _threading.Lock()
-
-
-def _default_backend() -> S3Backend:
-    """The one backend, and so the one client and connection pool, that every
-    `S3Path` built without `backend=` shares in this process."""
-    global _DEFAULT_BACKEND
-    with _DEFAULT_BACKEND_LOCK:
-        if _DEFAULT_BACKEND is None:
-            _DEFAULT_BACKEND = S3Backend()
-        return _DEFAULT_BACKEND
-
-
-def _reset_default_backend() -> None:
-    """Forget the shared default backend, so the next path builds a new one.
-    The test suite calls it between tests; paths that already hold the old
-    one keep it."""
-    global _DEFAULT_BACKEND
-    with _DEFAULT_BACKEND_LOCK:
-        _DEFAULT_BACKEND = None
-
+from ._s3_backend import BaseS3Backend, S3Backend, _default_backend
+from ._s3_errors import (
+    S3_ERRORS,
+    TRANSPORT_ERRORS,
+    S3UploadFailedError,
+    botoexc,
+    is_not_found,
+    is_not_implemented,
+    is_precondition_failed,
+    oserror,
+    reply_oserror,
+)
+from ._storepath import ObjectStorePath, check_place, digest_hex
+from ._writer import SpoolUploadStream
 
 _PUT_OBJECT_LIMIT = 5 * 1024**3
 """Largest body a single PutObject accepts, and the largest source a single
@@ -91,99 +31,6 @@ CopyObject copies; above it writes and renames use boto3's managed
 
 _SPOOL_SIZE = 8 * 1024**2
 """Bytes a write stream keeps in memory before spilling to a temp file."""
-
-# The `s3` extra. Without botocore the error tuples are empty (nothing to
-# catch) and the first client the backend builds raises an ImportError naming
-# the extra.
-_botoexc = _import_or_stub("botocore.exceptions", "s3")
-try:
-    # botocore's connection-level failures: an endpoint that cannot be reached,
-    # a timeout, a dropped connection, a body cut short. Not always an OSError,
-    # so exists() and walk()'s on_error would not see them untranslated.
-    _TRANSPORT_ERRORS = (
-        _botoexc.ConnectionError,
-        _botoexc.HTTPClientError,
-        _botoexc.IncompleteReadError,
-        _botoexc.FlexibleChecksumError,
-    )
-    _S3_ERRORS = (_botoexc.ClientError,) + _TRANSPORT_ERRORS
-    _TIMEOUT_ERRORS = (_botoexc.ReadTimeoutError, _botoexc.ConnectTimeoutError)
-    _INTERRUPTED_ERRORS = (
-        _botoexc.ConnectionClosedError,
-        _botoexc.ResponseStreamingError,
-        _botoexc.IncompleteReadError,
-    )
-except ImportError:
-    _TRANSPORT_ERRORS = _S3_ERRORS = _TIMEOUT_ERRORS = _INTERRUPTED_ERRORS = ()
-
-
-def _error_code(error: _botoexc.ClientError) -> str:
-    return str(error.response.get("Error", {}).get("Code", ""))
-
-
-def _http_status(error: _botoexc.ClientError) -> "int | None":
-    return error.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
-
-
-def _is_not_found(error: _botoexc.ClientError) -> bool:
-    return _reply_not_found(_error_code(error), _http_status(error))
-
-
-def _reply_not_found(code: str, status: "int | None") -> bool:
-    return code in ("404", "NoSuchKey", "NoSuchBucket", "NotFound") or status == 404
-
-
-def _is_precondition_failed(error: _botoexc.ClientError) -> bool:
-    # 412 PreconditionFailed: the key exists. 409 ConditionalRequestConflict:
-    # a concurrent conditional write to the key is in progress.
-    return (
-        _error_code(error) in ("PreconditionFailed", "ConditionalRequestConflict")
-        or _http_status(error) == 412
-    )
-
-
-def _is_not_implemented(error: _botoexc.ClientError) -> bool:
-    return _error_code(error) == "NotImplemented" or _http_status(error) == 501
-
-
-def _reply_oserror(
-    code: str, status: "int | None", message: str, path, action: "str | None" = None
-) -> OSError:
-    """The OSError the store's answer (`code`, HTTP `status`, `message`) means
-    for `path`: not found (a key or a bucket) is FileNotFoundError, access
-    denied PermissionError, anything else OSError(EIO). `action` names the
-    request in the message of the last two."""
-    if _reply_not_found(code, status):
-        return FileNotFoundError(
-            _errno.ENOENT, f"No such file or directory ({code})", str(path)
-        )
-    head = f"S3 {action} failed: " if action else ""
-    if code in ("403", "401", "AccessDenied", "AllAccessDisabled") or (
-        status in (401, 403)
-    ):
-        return PermissionError(_errno.EACCES, f"{head}{code}: {message}", str(path))
-    return OSError(_errno.EIO, f"{head or 'S3 '}{code}: {message}", str(path))
-
-
-def _oserror(error: Exception, path) -> OSError:
-    """The OSError a botocore error means for `path`: the store's answer as
-    `_reply_oserror()` reads it; a request that ran out of time is
-    TimeoutError, an endpoint that cannot be reached ConnectionError, a
-    connection that broke mid-answer ConnectionResetError, anything else
-    OSError. Raise it `from None`: the SDK's text can carry the request URL."""
-    if isinstance(error, _botoexc.ClientError):
-        message = error.response.get("Error", {}).get("Message") or str(error)
-        return _reply_oserror(_error_code(error), _http_status(error), message, path)
-    if isinstance(error, _TIMEOUT_ERRORS):
-        kind = _store.TIMEOUT
-    elif isinstance(error, _INTERRUPTED_ERRORS):
-        kind = _store.INTERRUPTED
-    elif isinstance(error, _botoexc.ConnectionError):
-        kind = _store.UNREACHABLE
-    else:
-        kind = _store.FAILED
-    return _store.transport_error(kind, "S3", path, error)
-
 
 _PLAIN_MD5 = _re.compile("[0-9a-fA-F]{32}")
 
@@ -223,21 +70,10 @@ def _copy_call(client, source: dict, bucket: str, key: str, size: int, extra: di
         client.copy_object(Bucket=bucket, Key=key, CopySource=source, **extra)
 
 
-def _object_key(path: str) -> str:
-    """The object key a s3 URI path names: leading `/`s dropped, and
-    exactly one trailing `/`. `s3://b/dir/` is the directory `dir`, the
-    way pathlib drops a trailing slash -- keeping it made the key `dir/`, so
-    the `dir/` marker object read as a file and `rm(recursive=True)` deleted
-    only the marker. Interior empty segments (`a//b`) are literal key bytes
-    and stay."""
-    key = path.lstrip("/")
-    return key[:-1] if key.endswith("/") else key
-
-
 class _S3BodyReader(_io.RawIOBase):
     """Reads a GetObject `StreamingBody` as it arrives, instead of loading
     the whole object into memory first. A failure of the connection in the
-    middle of the body is the `OSError` `_oserror()` makes of it."""
+    middle of the body is the `OSError` `oserror()` makes of it."""
 
     def __init__(self, body, path):
         super().__init__()
@@ -250,8 +86,8 @@ class _S3BodyReader(_io.RawIOBase):
     def readinto(self, buffer):
         try:
             data = self._body.read(len(buffer))
-        except _TRANSPORT_ERRORS as error:
-            raise _oserror(error, self._path) from None
+        except TRANSPORT_ERRORS as error:
+            raise oserror(error, self._path) from None
         size = len(data)
         buffer[:size] = data
         return size
@@ -265,10 +101,10 @@ class _S3BodyReader(_io.RawIOBase):
             super().close()
 
 
-class _S3WriteStream(_store.SpoolUploadStream):
-    """The spooled write of `s3:`, uploaded on close() as a managed transfer,
-    multipart above boto3's threshold, so objects over PutObject's 5 GB limit
-    can be written.
+class _S3WriteStream(SpoolUploadStream):
+    """The spooled write of `S3Path`, uploaded on close() as a managed
+    transfer, multipart above boto3's threshold, so objects over PutObject's
+    5 GB limit can be written.
 
     `exclusive` (`open("x")`) creates the key with a conditional PutObject
     (`IfNoneMatch="*"`), atomic against a concurrent creator."""
@@ -298,51 +134,86 @@ class _S3WriteStream(_store.SpoolUploadStream):
                 client.put_object(Bucket=path.bucket, Key=path.key, Body=body)
             else:
                 upload_fileobj(body, path.bucket, path.key)
-        except _S3_ERRORS as error:
-            raise _oserror(error, path) from None
-        except _S3UploadFailedError as error:
+        except S3_ERRORS as error:
+            raise oserror(error, path) from None
+        except S3UploadFailedError as error:
             # boto3 wraps the store's answer; the answer is what means something.
             cause = error.__context__
-            if isinstance(cause, _S3_ERRORS):
-                raise _oserror(cause, path) from None
+            if isinstance(cause, S3_ERRORS):
+                raise oserror(cause, path) from None
             raise OSError(_errno.EIO, str(error), str(path)) from None
 
 
-class S3Path(_store.ObjectStorePath):
-    """`s3:` scheme (`s3://bucket/key/path`): read/write/list via `boto3`.
-    Requires the `s3` extra. S3 has no real directories -- `is_dir()` is
-    prefix emulation (any object key under `"<path>/"`), and `mkdir()`
-    creates a zero-byte `"<path>/"` marker object (the same convention the
-    AWS console itself uses for an empty "folder"); see
-    `docs/divergences.md`. `rename()` uses server-side `copy_object` +
-    `delete_object` (same-bucket only) instead of the generic
+class S3Path(ObjectStorePath):
+    """A path in an Amazon S3 bucket (or any S3-compatible store), read and
+    written through `boto3`. Needs the `s3` extra.
+
+    `S3Path("dir/key", bucket="bkt")` is the key `dir/key` of the bucket
+    `bkt`. The client options (`region_name=`, `endpoint_url=`,
+    `aws_access_key_id=`, ...) build the path's own `S3Backend`; `backend=`
+    shares one client between paths built separately, or plugs in a
+    `BaseS3Backend` of your own. Giving `backend=` together with a client
+    option is a `TypeError`. Without either, paths share one default backend
+    per process. A path joined from another keeps its bucket and its backend,
+    and `bucket=` moves it to another bucket on the same backend. Nothing
+    connects when a path is built.
+
+    S3 has no real directories -- `is_dir()` is prefix emulation (any object
+    key under `"<path>/"`), and `mkdir()` creates a zero-byte `"<path>/"`
+    marker object (the same convention the AWS console itself uses for an
+    empty "folder"). `rename()` uses server-side `copy_object` +
+    `delete_object` (same bucket only) instead of the generic
     download+upload+delete `move()` fallback; a prefix directory is not
     renamed (NotImplementedError), so `move()` copies and removes it."""
 
-    __SCHEMES = ("s3",)
     __slots__ = ()
 
     if _ty.TYPE_CHECKING:
-        backend: BaseS3Backend
+        _backend: BaseS3Backend
 
-    def _initbackend(self):
-        return _default_backend()
+    def __init__(
+        self,
+        *segments: "str | S3Path",
+        bucket: "str | None" = None,
+        backend: "BaseS3Backend | None" = None,
+        **client_kwargs,
+    ):
+        text, donor = self._join(segments)
+        place = check_place("bucket", bucket, donor, "S3Path")
+        if backend is not None and client_kwargs:
+            raise TypeError(
+                "pass either backend= or the client options "
+                "(region_name=, endpoint_url=, ...), not both"
+            )
+        if backend is None:
+            if client_kwargs:
+                backend = S3Backend(**client_kwargs)
+            elif donor is not None:
+                backend = donor._backend
+            else:
+                backend = _default_backend()
+        self._initialize(text, place, backend)
+
+    def _keywords(self) -> dict:
+        return {"bucket": self._place}
+
+    def _uri_root(self) -> str:
+        return f"s3://{self._place}"
+
+    def __repr__(self) -> str:
+        shown = [repr(self.as_posix()), f"bucket={self._place!r}"]
+        if self._backend is not _default_backend():
+            shown.append(f"backend={self._backend!r}")
+        return f"{type(self).__name__}({', '.join(shown)})"
 
     @property
     def bucket(self) -> str:
-        return self.source.host
-
-    @property
-    def key(self) -> str:
-        return _object_key(self.path)
+        """The name of the bucket."""
+        return self._place
 
     @property
     def _client(self):
-        if not self.bucket:
-            raise FileNotFoundError(
-                _errno.ENOENT, "an s3: path needs a bucket", str(self)
-            )
-        return self.backend.client()
+        return self._backend.client()
 
     def _not_a_directory(self):
         return NotADirectoryError(_errno.ENOTDIR, "Not a directory", str(self))
@@ -386,8 +257,8 @@ class S3Path(_store.ObjectStorePath):
                             st_mtime=mtime,
                             is_dir=False,
                         )
-        except _S3_ERRORS as error:
-            raise _oserror(error, self) from None
+        except S3_ERRORS as error:
+            raise oserror(error, self) from None
         if empty and self.key:
             # Nothing under the prefix: a missing path or a file, which
             # pathlib's iterdir() refuses. Only an empty listing pays this.
@@ -395,17 +266,13 @@ class S3Path(_store.ObjectStorePath):
                 raise self._not_a_directory()
 
     def _open(self, mode="r", buffering=-1):
-        if not self.bucket:
-            raise FileNotFoundError(
-                _errno.ENOENT, "an s3: path needs a bucket", str(self)
-            )
         if mode in ("r", "r+"):
             if not self.key:
                 raise IsADirectoryError(_errno.EISDIR, "Is a directory", str(self))
             try:
                 resp = self._client.get_object(Bucket=self.bucket, Key=self.key)
-            except _S3_ERRORS as error:
-                translated = _oserror(error, self)
+            except S3_ERRORS as error:
+                translated = oserror(error, self)
                 if isinstance(translated, FileNotFoundError) and self.is_dir():
                     translated = IsADirectoryError(
                         _errno.EISDIR, "Is a directory", str(self)
@@ -439,34 +306,34 @@ class S3Path(_store.ObjectStorePath):
             self._client.put_object(
                 Bucket=self.bucket, Key=key, Body=body, IfNoneMatch="*"
             )
-        except _botoexc.ClientError as error:
-            if _is_precondition_failed(error):
+        except botoexc.ClientError as error:
+            if is_precondition_failed(error):
                 raise FileExistsError(_errno.EEXIST, "File exists", str(self)) from None
-            if _is_not_implemented(error):
+            if is_not_implemented(error):
                 return False
-            raise _oserror(error, self) from None
-        except _TRANSPORT_ERRORS as error:
-            raise _oserror(error, self) from None
+            raise oserror(error, self) from None
+        except TRANSPORT_ERRORS as error:
+            raise oserror(error, self) from None
         return True
 
     def _stat_root(self) -> FileStat:
         try:
             self._client.head_bucket(Bucket=self.bucket)
-        except _S3_ERRORS as error:
-            raise _oserror(error, self) from None
+        except S3_ERRORS as error:
+            raise oserror(error, self) from None
         return FileStat(is_dir=True)
 
     def _stat_object(self, key: str) -> "FileStat | None":
         try:
             head = self._client.head_object(Bucket=self.bucket, Key=key)
-        except _botoexc.ClientError as error:
+        except botoexc.ClientError as error:
             # A 403 stays PermissionError: S3 answers HEAD of a missing key
             # with 403 when the caller may not list the bucket.
-            if not _is_not_found(error):
-                raise _oserror(error, self) from None
+            if not is_not_found(error):
+                raise oserror(error, self) from None
             return None
-        except _TRANSPORT_ERRORS as error:
-            raise _oserror(error, self) from None
+        except TRANSPORT_ERRORS as error:
+            raise oserror(error, self) from None
         return FileStat(
             st_size=head["ContentLength"],
             st_mtime=int(head["LastModified"].timestamp()),
@@ -477,12 +344,12 @@ class S3Path(_store.ObjectStorePath):
         extra = {} if algorithm == "md5" else {"ChecksumMode": "ENABLED"}
         try:
             head = self._client.head_object(Bucket=self.bucket, Key=key, **extra)
-        except _botoexc.ClientError as error:
-            if _is_not_found(error):
+        except botoexc.ClientError as error:
+            if is_not_found(error):
                 return None
-            raise _oserror(error, self) from None
-        except _TRANSPORT_ERRORS as error:
-            raise _oserror(error, self) from None
+            raise oserror(error, self) from None
+        except TRANSPORT_ERRORS as error:
+            raise oserror(error, self) from None
         digests = {}
         md5 = _plain_md5(head)
         if md5 is not None:
@@ -493,16 +360,16 @@ class S3Path(_store.ObjectStorePath):
             for name, field in _CHECKSUM_FIELDS.items():
                 value = head.get(field)
                 if value and "-" not in value:
-                    digests[name] = _store.digest_hex(value)
+                    digests[name] = digest_hex(value)
         return digests
 
     def _has_object(self, key: str) -> bool:
         try:
             self._client.head_object(Bucket=self.bucket, Key=key)
-        except _S3_ERRORS as error:
-            if isinstance(error, _botoexc.ClientError) and _is_not_found(error):
+        except S3_ERRORS as error:
+            if isinstance(error, botoexc.ClientError) and is_not_found(error):
                 return False
-            raise _oserror(error, self) from None
+            raise oserror(error, self) from None
         return True
 
     def _has_prefix(self, key: str) -> bool:
@@ -510,8 +377,8 @@ class S3Path(_store.ObjectStorePath):
             resp = self._client.list_objects_v2(
                 Bucket=self.bucket, Prefix=f"{key}/", MaxKeys=1
             )
-        except _S3_ERRORS as error:
-            raise _oserror(error, self) from None
+        except S3_ERRORS as error:
+            raise oserror(error, self) from None
         return resp.get("KeyCount", 0) > 0
 
     def _flat_entries(self, prefix: str) -> "list[tuple[str, int]]":
@@ -523,31 +390,31 @@ class S3Path(_store.ObjectStorePath):
                 for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix)
                 for obj in page.get("Contents", [])
             ]
-        except _S3_ERRORS as error:
-            raise _oserror(error, self) from None
+        except S3_ERRORS as error:
+            raise oserror(error, self) from None
 
     def _first_keys(self, prefix: str, limit: int) -> "list[str]":
         try:
             resp = self._client.list_objects_v2(
                 Bucket=self.bucket, Prefix=prefix, MaxKeys=limit
             )
-        except _S3_ERRORS as error:
-            raise _oserror(error, self) from None
+        except S3_ERRORS as error:
+            raise oserror(error, self) from None
         return [obj["Key"] for obj in resp.get("Contents", [])]
 
     def _put_marker(self, key: str) -> None:
         if not self._put_exclusive(b"", key=key):
             try:
                 self._client.put_object(Bucket=self.bucket, Key=key, Body=b"")
-            except _S3_ERRORS as error:
-                raise _oserror(error, self) from None
+            except S3_ERRORS as error:
+                raise oserror(error, self) from None
 
     def _delete_object(self, key: str, *, missing_ok: bool) -> None:
         # S3 never answers a delete with "not found".
         try:
             self._client.delete_object(Bucket=self.bucket, Key=key)
-        except _S3_ERRORS as error:
-            raise _oserror(error, self) from None
+        except S3_ERRORS as error:
+            raise oserror(error, self) from None
 
     def _delete_keys(self, keys: "list[str]", on_error) -> None:
         iterator = iter(keys)
@@ -560,8 +427,8 @@ class S3Path(_store.ObjectStorePath):
                     Bucket=self.bucket,
                     Delete={"Objects": [{"Key": key} for key in batch]},
                 )
-            except _S3_ERRORS as error:
-                translated = _oserror(error, self)
+            except S3_ERRORS as error:
+                translated = oserror(error, self)
                 if not on_error(translated):
                     raise translated from None
                 continue
@@ -569,7 +436,7 @@ class S3Path(_store.ObjectStorePath):
             # is offered with its own path.
             for entry in response.get("Errors", []) if response else []:
                 failed_path = self._key_path(entry.get("Key", ""))
-                failed = _reply_oserror(
+                failed = reply_oserror(
                     str(entry.get("Code", "")),
                     None,
                     entry.get("Message", ""),
@@ -582,10 +449,10 @@ class S3Path(_store.ObjectStorePath):
     def _rename_source(self, key: str):
         try:
             return self._client.head_object(Bucket=self.bucket, Key=key)
-        except _S3_ERRORS as error:
-            if isinstance(error, _botoexc.ClientError) and _is_not_found(error):
+        except S3_ERRORS as error:
+            if isinstance(error, botoexc.ClientError) and is_not_found(error):
                 return None
-            raise _oserror(error, self) from None
+            raise oserror(error, self) from None
 
     def _rename_copy(self, head, dest, dest_key: str) -> None:
         client = self._client
@@ -605,17 +472,16 @@ class S3Path(_store.ObjectStorePath):
                 extra,
             )
             client.delete_object(Bucket=self.bucket, Key=self.key)
-        except _S3_ERRORS as error:
-            raise _oserror(error, self) from None
+        except S3_ERRORS as error:
+            raise oserror(error, self) from None
 
     def _copy_object(self, target: "S3Path", size: int) -> bool:
-        # A target with no bucket is "a path needs a bucket", as for a write.
         client = target._client
         source = {"Bucket": self.bucket, "Key": self.key}
         try:
             _copy_call(client, source, target.bucket, target.key, size, {})
-        except _S3_ERRORS as error:
-            if isinstance(error, _botoexc.ClientError) and _is_not_implemented(error):
+        except S3_ERRORS as error:
+            if isinstance(error, botoexc.ClientError) and is_not_implemented(error):
                 return False
-            raise _oserror(error, self) from None
+            raise oserror(error, self) from None
         return True

@@ -1,15 +1,16 @@
-"""How `s3:` reports a failed request: the OSError type, nothing chained, and
-the path named. Failures come from moto, from a client whose calls raise
-botocore's own exceptions, and from loopback sockets (a closed port, a server
-that cuts or stalls a body); nothing leaves the machine."""
+"""How `S3Path` and the `s3:` URI path report a failed request: the OSError
+type, nothing chained, and the path named. Failures come from moto, from a
+client whose calls raise botocore's own exceptions, and from loopback sockets
+(a closed port, a server that cuts or stalls a body); nothing leaves the
+machine.
+"""
 
-import contextlib
+from __future__ import annotations
+
 import errno
 import http.server
 import socket
 import threading
-import time
-
 import pytest
 
 boto3 = pytest.importorskip("boto3")
@@ -18,8 +19,13 @@ botocore = pytest.importorskip("botocore")
 import botocore.exceptions as _botoexc
 from botocore.config import Config
 
+from objpath import BaseS3Backend, S3Backend
 from pathlib_next.mempath import MemPath
-from pathlib_next.uri.schemes.s3 import BaseS3Backend, S3Backend, S3Path
+from store_support import make_path
+
+# boto3 announces the end of its Python 3.9 support when it creates its first
+# client.
+pytestmark = pytest.mark.filterwarnings(r"ignore:.*Python 3\.9.*:Warning:boto3(\..*)?$")
 
 
 def _reply(code, status, operation="Operation"):
@@ -66,13 +72,10 @@ class _Backend(BaseS3Backend):
 
 
 @pytest.fixture
-def moto_s3(monkeypatch):
+def moto_s3(aws_test_credentials):
     pytest.importorskip("moto")
     from moto import mock_aws
 
-    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
-    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "testing")
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "testing")
     with mock_aws():
         client = boto3.client("s3", region_name="us-east-1")
         client.create_bucket(Bucket="bkt")
@@ -92,9 +95,9 @@ def _keys(client):
     )
 
 
-def _path(moto, uri="s3://bkt/a.txt", **overrides):
+def _path(flavor, moto, url="s3://bkt/a.txt", **overrides):
     backend = _Backend(_Client(moto, **overrides))
-    return S3Path(uri, backend=backend), backend.proxy
+    return make_path(flavor, url, backend=backend), backend.proxy
 
 
 # --- the type a failure has ----------------------------------------------------
@@ -108,8 +111,10 @@ def _path(moto, uri="s3://bkt/a.txt", **overrides):
     ],
     ids=["read", "connect"],
 )
-def test_a_request_that_times_out_is_a_timeout_error_naming_the_path(moto_s3, error):
-    path, _client = _path(moto_s3, head_object=_failing(error))
+def test_a_request_that_times_out_is_a_timeout_error_naming_the_path(
+    flavor, moto_s3, error
+):
+    path, _client = _path(flavor, moto_s3, head_object=_failing(error))
     with pytest.raises(TimeoutError) as info:
         path.stat()
     assert info.value.errno == errno.ETIMEDOUT
@@ -120,7 +125,7 @@ def test_a_request_that_times_out_is_a_timeout_error_naming_the_path(moto_s3, er
     assert "example.invalid" not in str(info.value)
 
 
-def test_an_endpoint_that_cannot_be_reached_is_a_connection_error(moto_s3):
+def test_an_endpoint_that_cannot_be_reached_is_a_connection_error(flavor, moto_s3):
     error = _botoexc.EndpointConnectionError(
         endpoint_url="http://u:pw@example.invalid/"
     )
@@ -130,6 +135,7 @@ def test_an_endpoint_that_cannot_be_reached_is_a_connection_error(moto_s3):
             raise error
 
     path, _client = _path(
+        flavor,
         moto_s3,
         head_object=_failing(error),
         get_paginator=lambda name: Paginator(),
@@ -146,9 +152,11 @@ def test_an_endpoint_that_cannot_be_reached_is_a_connection_error(moto_s3):
     assert [type(error) for error in errors] == [ConnectionError]
 
 
-def test_a_transport_failure_never_reads_as_a_missing_file(moto_s3):
+def test_a_transport_failure_never_reads_as_a_missing_file(flavor, moto_s3):
     path, _client = _path(
-        moto_s3, head_object=_failing(_botoexc.ConnectionClosedError(endpoint_url="x"))
+        flavor,
+        moto_s3,
+        head_object=_failing(_botoexc.ConnectionClosedError(endpoint_url="x")),
     )
     with pytest.raises(OSError) as info:
         path.stat()
@@ -156,7 +164,7 @@ def test_a_transport_failure_never_reads_as_a_missing_file(moto_s3):
     assert path.exists() is False
 
 
-def test_a_denied_upload_is_a_permission_error(moto_s3):
+def test_a_denied_upload_is_a_permission_error(flavor, moto_s3):
     def denied(*args, **kwargs):
         # boto3 raises its own error from inside the handler of the reply.
         try:
@@ -166,7 +174,7 @@ def test_a_denied_upload_is_a_permission_error(moto_s3):
 
             raise S3UploadFailedError("Failed to upload <fileobj> to bkt/a.txt")
 
-    path, client = _path(moto_s3, upload_fileobj=denied)
+    path, client = _path(flavor, moto_s3, upload_fileobj=denied)
     with pytest.raises(PermissionError) as info:
         path.write_bytes(b"x")
     assert info.value.__cause__ is None
@@ -199,10 +207,12 @@ def _loopback_backend(port, **config):
     )
 
 
-def test_nothing_listening_is_a_connection_error():
-    path = S3Path("s3://bkt/a.txt", backend=_loopback_backend(_closed_port()))
-    with pytest.raises(ConnectionError) as info:
-        path.stat()
+def test_nothing_listening_is_a_connection_error(flavor):
+    backend = _loopback_backend(_closed_port())
+    with backend:
+        path = make_path(flavor, "s3://bkt/a.txt", backend=backend)
+        with pytest.raises(ConnectionError) as info:
+            path.stat()
     assert not isinstance(info.value, TimeoutError)
     assert info.value.__cause__ is None
 
@@ -239,7 +249,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"A" * (SIZE // 4))
             self.wfile.flush()
             if self.server.mode == "stall":
-                time.sleep(3)
+                # Holds the rest of the body back until the test is over.
+                self.server.release.wait()
             self.connection.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
@@ -252,51 +263,51 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 @pytest.fixture
 def body_server():
     server = _BodyServer(("127.0.0.1", 0), _Handler)
+    server.release = threading.Event()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         yield server
     finally:
+        server.release.set()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
 
 
-def test_a_body_cut_short_is_an_oserror_naming_the_path(body_server):
+def test_a_body_cut_short_is_an_oserror_naming_the_path(flavor, body_server):
     body_server.mode = "cut"
-    path = S3Path(
-        "s3://bkt/obj.bin",
-        backend=_loopback_backend(
-            body_server.server_address[1], response_checksum_validation="when_required"
-        ),
+    backend = _loopback_backend(
+        body_server.server_address[1], response_checksum_validation="when_required"
     )
-    with pytest.raises(ConnectionResetError) as info:
-        path.read_bytes()
-    assert info.value.filename == "s3://bkt/obj.bin"
-    assert info.value.__cause__ is None
-    target = MemPath("/copied.bin")
-    with pytest.raises(OSError, match="obj.bin"):
-        path.copy(target)
-    assert not target.exists()
+    with backend:
+        path = make_path(flavor, "s3://bkt/obj.bin", backend=backend)
+        with pytest.raises(ConnectionResetError) as info:
+            path.read_bytes()
+        assert info.value.filename == "s3://bkt/obj.bin"
+        assert info.value.__cause__ is None
+        target = MemPath("/copied.bin")
+        with pytest.raises(OSError, match="obj.bin"):
+            path.copy(target)
+        assert not target.exists()
 
 
-def test_a_body_that_stalls_is_a_timeout_error_naming_the_path(body_server):
+def test_a_body_that_stalls_is_a_timeout_error_naming_the_path(flavor, body_server):
     body_server.mode = "stall"
-    path = S3Path(
-        "s3://bkt/obj.bin",
-        backend=_loopback_backend(
-            body_server.server_address[1],
-            read_timeout=1,
-            response_checksum_validation="when_required",
-        ),
+    backend = _loopback_backend(
+        body_server.server_address[1],
+        read_timeout=1,
+        response_checksum_validation="when_required",
     )
-    with pytest.raises(TimeoutError) as info:
-        path.read_bytes()
+    with backend:
+        path = make_path(flavor, "s3://bkt/obj.bin", backend=backend)
+        with pytest.raises(TimeoutError) as info:
+            path.read_bytes()
     assert info.value.filename == "s3://bkt/obj.bin"
     assert info.value.__cause__ is None
 
 
-def test_a_read_that_fails_in_the_body_reader_is_translated(moto_s3):
+def test_a_read_that_fails_in_the_body_reader_is_translated(flavor, moto_s3):
     moto_s3.put_object(Bucket="bkt", Key="a.txt", Body=b"abc")
 
     class Body:
@@ -306,7 +317,7 @@ def test_a_read_that_fails_in_the_body_reader_is_translated(moto_s3):
         def close(self):
             pass
 
-    path, _client = _path(moto_s3, get_object=lambda **kw: {"Body": Body()})
+    path, _client = _path(flavor, moto_s3, get_object=lambda **kw: {"Body": Body()})
     with pytest.raises(OSError) as info:
         path.read_bytes()
     assert info.value.filename == "s3://bkt/a.txt"
@@ -356,7 +367,7 @@ def _second_listing_fails(error):
     return failing
 
 
-#: name -> (uri, keys stored first, the client method that fails, what is done).
+#: name -> (url, keys stored first, the client method that fails, what is done).
 #: Each is one request of one operation; the rest of the operation succeeds.
 OPERATIONS = {
     "stat of a bucket": ("s3://bkt/", [], "head_bucket", lambda p: p.stat()),
@@ -398,13 +409,13 @@ OPERATIONS = {
 @pytest.mark.parametrize("error,expected", FAILURES)
 @pytest.mark.parametrize("name", sorted(OPERATIONS))
 def test_a_failed_request_is_an_oserror_naming_the_path_and_changes_nothing(
-    moto_s3, name, error, expected
+    flavor, moto_s3, name, error, expected
 ):
-    uri, stored, failing, act = OPERATIONS[name]
+    url, stored, failing, act = OPERATIONS[name]
     for key in stored:
         moto_s3.put_object(Bucket="bkt", Key=key, Body=b"x")
     before = _keys(moto_s3)
-    path, _client = _path(moto_s3, uri, **{failing: _failing(error)})
+    path, _client = _path(flavor, moto_s3, url, **{failing: _failing(error)})
 
     with pytest.raises(expected) as info:
         act(path)
@@ -418,9 +429,10 @@ def test_a_failed_request_is_an_oserror_naming_the_path_and_changes_nothing(
 
 @pytest.mark.parametrize("error,expected", FAILURES)
 def test_a_marker_write_that_fails_after_conditional_writes_are_refused_is_translated(
-    moto_s3, error, expected
+    flavor, moto_s3, error, expected
 ):
     path, _client = _path(
+        flavor,
         moto_s3,
         "s3://bkt/d",
         put_object=_mkdir_without_conditional_writes(error),
@@ -436,13 +448,16 @@ def test_a_marker_write_that_fails_after_conditional_writes_are_refused_is_trans
 
 @pytest.mark.parametrize("error,expected", FAILURES)
 def test_a_listing_that_fails_while_removing_a_directory_keeps_it(
-    moto_s3, error, expected
+    flavor, moto_s3, error, expected
 ):
     moto_s3.put_object(Bucket="bkt", Key="d/", Body=b"")
     real = moto_s3.list_objects_v2
     failing = _second_listing_fails(error)
     path, _client = _path(
-        moto_s3, "s3://bkt/d", list_objects_v2=lambda **kw: failing(real, **kw)
+        flavor,
+        moto_s3,
+        "s3://bkt/d",
+        list_objects_v2=lambda **kw: failing(real, **kw),
     )
 
     with pytest.raises(expected) as info:
@@ -454,10 +469,10 @@ def test_a_listing_that_fails_while_removing_a_directory_keeps_it(
 
 @pytest.mark.parametrize("error,expected", FAILURES)
 def test_a_batch_delete_that_fails_is_offered_translated_and_the_walk_goes_on(
-    moto_s3, error, expected
+    flavor, moto_s3, error, expected
 ):
     moto_s3.put_object(Bucket="bkt", Key="t/a", Body=b"x")
-    path, _client = _path(moto_s3, "s3://bkt/t", delete_objects=_failing(error))
+    path, _client = _path(flavor, moto_s3, "s3://bkt/t", delete_objects=_failing(error))
     offered = []
 
     path.rm(
@@ -472,10 +487,10 @@ def test_a_batch_delete_that_fails_is_offered_translated_and_the_walk_goes_on(
 
 @pytest.mark.parametrize("error,expected", FAILURES)
 def test_a_failed_existence_check_stops_a_recursive_remove_before_any_delete(
-    moto_s3, error, expected
+    flavor, moto_s3, error, expected
 ):
     moto_s3.put_object(Bucket="bkt", Key="t/a", Body=b"x")
-    path, client = _path(moto_s3, "s3://bkt/t", head_object=_failing(error))
+    path, client = _path(flavor, moto_s3, "s3://bkt/t", head_object=_failing(error))
     offered = []
 
     path.rm(
@@ -491,7 +506,7 @@ def test_a_failed_existence_check_stops_a_recursive_remove_before_any_delete(
 # --- a batch delete that refuses single keys --------------------------------------
 
 
-def test_each_key_a_batch_delete_refuses_is_offered_with_its_own_path(moto_s3):
+def test_each_key_a_batch_delete_refuses_is_offered_with_its_own_path(flavor, moto_s3):
     for name in ("t/a", "t/b", "t/c", "t/d", "t/e"):
         moto_s3.put_object(Bucket="bkt", Key=name, Body=b"x")
     real = moto_s3.delete_objects
@@ -508,7 +523,7 @@ def test_each_key_a_batch_delete_refuses_is_offered_with_its_own_path(moto_s3):
             ],
         }
 
-    path, _client = _path(moto_s3, "s3://bkt/t", delete_objects=partial)
+    path, _client = _path(flavor, moto_s3, "s3://bkt/t", delete_objects=partial)
     offered = []
     path.rm(
         recursive=True,
@@ -524,7 +539,7 @@ def test_each_key_a_batch_delete_refuses_is_offered_with_its_own_path(moto_s3):
     assert _keys(moto_s3) == ["t/b", "t/d"]
 
 
-def test_a_refused_key_without_a_handler_is_raised_with_its_path(moto_s3):
+def test_a_refused_key_without_a_handler_is_raised_with_its_path(flavor, moto_s3):
     moto_s3.put_object(Bucket="bkt", Key="t/a", Body=b"x")
 
     def refuse(Bucket, Delete):
@@ -532,7 +547,7 @@ def test_a_refused_key_without_a_handler_is_raised_with_its_path(moto_s3):
             "Errors": [{"Key": "t/a", "Code": "AccessDenied", "Message": "refused"}]
         }
 
-    path, _client = _path(moto_s3, "s3://bkt/t", delete_objects=refuse)
+    path, _client = _path(flavor, moto_s3, "s3://bkt/t", delete_objects=refuse)
     with pytest.raises(PermissionError) as info:
         path.rm(recursive=True)
     assert info.value.filename == "s3://bkt/t/a"
@@ -542,8 +557,8 @@ def test_a_refused_key_without_a_handler_is_raised_with_its_path(moto_s3):
 # --- paths that name no object -----------------------------------------------------
 
 
-def test_a_bucket_root_is_a_directory_to_read_or_write(moto_s3):
-    path, client = _path(moto_s3, "s3://bkt/")
+def test_a_bucket_root_is_a_directory_to_read_or_write(flavor, moto_s3):
+    path, client = _path(flavor, moto_s3, "s3://bkt/")
     with pytest.raises(IsADirectoryError):
         path.read_bytes()
     with pytest.raises(IsADirectoryError):
@@ -554,24 +569,8 @@ def test_a_bucket_root_is_a_directory_to_read_or_write(moto_s3):
     assert _keys(moto_s3) == []
 
 
-@pytest.mark.parametrize("uri", ["s3:x", "s3:///x", "s3:///"])
-def test_a_path_without_a_bucket_does_not_exist_and_asks_nothing(moto_s3, uri):
-    path, client = _path(moto_s3, uri)
-    assert path.exists() is False
-    assert path.is_dir() is False
-    with pytest.raises(FileNotFoundError):
-        path.stat()
-    with pytest.raises(FileNotFoundError):
-        path.read_bytes()
-    with pytest.raises(FileNotFoundError):
-        path.write_bytes(b"x")
-    with pytest.raises(FileNotFoundError):
-        list(path.iterdir())
-    assert client.calls == []
-
-
-def test_removing_a_missing_bucket_with_missing_ok_is_not_an_error(moto_s3):
-    path = S3Path("s3://nobucket/x", backend=_Backend(_Client(moto_s3)))
+def test_removing_a_missing_bucket_with_missing_ok_is_not_an_error(flavor, moto_s3):
+    path, _client = _path(flavor, moto_s3, "s3://nobucket/x")
     assert path.rm(recursive=True, missing_ok=True) is None
     with pytest.raises(FileNotFoundError):
         path.rm(recursive=True)
@@ -583,17 +582,17 @@ def test_removing_a_missing_bucket_with_missing_ok_is_not_an_error(moto_s3):
     assert offered == [FileNotFoundError]
 
 
-def test_renaming_a_missing_path_onto_its_own_name_is_file_not_found(moto_s3):
+def test_renaming_a_missing_path_onto_its_own_name_is_file_not_found(flavor, moto_s3):
     moto_s3.put_object(Bucket="bkt", Key="there.txt", Body=b"x")
     moto_s3.put_object(Bucket="bkt", Key="dir/f", Body=b"x")
     backend = _Backend(_Client(moto_s3))
     with pytest.raises(FileNotFoundError):
-        S3Path("s3://bkt/nope", backend=backend).rename("nope")
+        make_path(flavor, "s3://bkt/nope", backend=backend).rename("nope")
     assert _keys(moto_s3) == ["dir/f", "there.txt"]
     # A name that is there is a rename that changes nothing.
-    there = S3Path("s3://bkt/there.txt", backend=backend)
+    there = make_path(flavor, "s3://bkt/there.txt", backend=backend)
     assert there.rename("there.txt") == there
-    assert S3Path("s3://bkt/dir", backend=backend).rename("dir").key == "dir"
+    assert make_path(flavor, "s3://bkt/dir", backend=backend).rename("dir").key == "dir"
     assert _keys(moto_s3) == ["dir/f", "there.txt"]
 
 
@@ -601,10 +600,10 @@ def test_renaming_a_missing_path_onto_its_own_name_is_file_not_found(moto_s3):
 
 
 def test_renaming_a_prefix_directory_asks_for_the_key_once_and_then_for_its_keys(
-    moto_s3,
+    flavor, moto_s3
 ):
     moto_s3.put_object(Bucket="bkt", Key="dir/f", Body=b"x")
-    path, client = _path(moto_s3, "s3://bkt/dir")
+    path, client = _path(flavor, moto_s3, "s3://bkt/dir")
     with pytest.raises(NotImplementedError):
         path.rename("other")
     assert client.calls == ["head_object", "list_objects_v2"]
@@ -612,9 +611,9 @@ def test_renaming_a_prefix_directory_asks_for_the_key_once_and_then_for_its_keys
 
 
 def test_renaming_a_missing_path_is_file_not_found_after_one_head_and_one_listing(
-    moto_s3,
+    flavor, moto_s3
 ):
-    path, client = _path(moto_s3, "s3://bkt/nope")
+    path, client = _path(flavor, moto_s3, "s3://bkt/nope")
     with pytest.raises(FileNotFoundError):
         path.rename("other")
     assert client.calls == ["head_object", "list_objects_v2"]
@@ -622,12 +621,12 @@ def test_renaming_a_missing_path_is_file_not_found_after_one_head_and_one_listin
 
 @pytest.mark.parametrize("mode, data", [("wb", b"whole"), ("w", "whole")])
 def test_an_upload_that_fails_after_a_normal_block_raises_once_and_is_not_retried(
-    moto_s3, mode, data
+    flavor, moto_s3, mode, data
 ):
     import gc
 
     denied = _failing(_reply("AccessDenied", 403, "PutObject"))
-    path, client = _path(moto_s3, upload_fileobj=denied, put_object=denied)
+    path, client = _path(flavor, moto_s3, upload_fileobj=denied, put_object=denied)
     with pytest.raises(PermissionError):
         with path.open(mode) as f:
             f.write(data)

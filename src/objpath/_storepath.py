@@ -1,201 +1,31 @@
-"""What `s3:`, `gs:` and `az:` share: how a transport failure becomes an
-`OSError`, which keys of a prefix a directory walk can reach, the guard that
-keeps a recursive copy and a recursive remove to the same set of keys, and the
-ranged reader and spooled writer of a stream.
-
-A walk lists one level at a time with a delimiter, so it never visits a key
-whose name has an empty, `.` or `..` segment, the subtree below a key that is
-also an object, or the content of a key that ends in the delimiter. A flat
-listing of the prefix holds all of them."""
+"""`ObjectStorePath`, what `S3Path`, `GSPath` and `AZPath` share: a key
+namespace with no directories, where a directory is any prefix `key/` that has
+keys under it and `mkdir()` writes an empty `key/` marker."""
 
 from __future__ import annotations
 
 import base64 as _base64
 import contextlib as _contextlib
 import errno as _errno
-import io as _io
 import stat as _stat
-import tempfile as _tempfile
 import threading as _threading
 import typing as _ty
+import urllib.parse as _urlparse
 
-from ... import providers as _providers
-from ...providers import check_follow, copy_error_predicate
-from ... import FileStat
-from .. import UriPath as _UriPath
+from pathlib_next import FileStat, Path, Pathname
+from pathlib_next.providers import TreePath, check_follow, copy_error_predicate
+
+from ._keys import parse_names, refusal, split_names, unreachable_keys
 
 _state = _threading.local()
 
-#: What a failure of the connection to the store is, as `transport_error()` raises
-#: it: the request ran out of time, the endpoint was unreachable, the connection
-#: broke after the store began to answer, or anything else the HTTP client reported.
-TIMEOUT, UNREACHABLE, INTERRUPTED, FAILED = (
-    "timeout",
-    "unreachable",
-    "interrupted",
-    "failed",
-)
-
-_TRANSPORT = {
-    TIMEOUT: (TimeoutError, _errno.ETIMEDOUT, "request timed out"),
-    UNREACHABLE: (ConnectionError, _errno.EHOSTUNREACH, "endpoint unreachable"),
-    INTERRUPTED: (
-        ConnectionResetError,
-        _errno.ECONNRESET,
-        "connection lost before the response was complete",
-    ),
-    FAILED: (OSError, _errno.EIO, "request failed"),
-}
-
-
-def transport_error(kind: str, store: str, path, error: BaseException) -> OSError:
-    """The `OSError` for a transport failure of `store` ("S3", "GCS", "Azure")
-    on `path`: `TimeoutError`, `ConnectionError`, `ConnectionResetError` or
-    plain `OSError` by `kind`, with the path as `filename`. Only the type name
-    of `error` reaches the message: an HTTP client's own text carries the
-    request URL, and with it any query-string credential. Raise it
-    `from None`."""
-    cls, number, text = _TRANSPORT[kind]
-    return cls(number, f"{store} {text} ({type(error).__name__})", str(path))
-
-
-def mentions_timeout(error: BaseException) -> bool:
-    """Whether `error`, or an exception it wraps (`__cause__`, `__context__`,
-    an SDK's `inner_exception` or `cause`, a `reason` or an argument), is a
-    timeout of any HTTP client: a type named `Timeout`, `ReadTimeout`,
-    `ConnectTimeoutError`, ..., or `TimeoutError` itself. The client libraries
-    are matched by name so none has to be imported. urllib3's
-    `NewConnectionError` derives from its `ConnectTimeoutError` but means the
-    connection was refused or the name did not resolve: it is not one."""
-    pending = [error]
-    for _ in range(8):
-        if not pending:
-            break
-        current = pending.pop()
-        if current is None:
-            continue
-        names = {cls.__name__ for cls in type(current).__mro__}
-        if "NewConnectionError" in names:
-            continue
-        if any(
-            name.endswith(("Timeout", "TimeoutError")) or name == "timeout"
-            for name in names
-        ):
-            return True
-        for attr in ("__cause__", "__context__", "inner_exception", "cause", "reason"):
-            pending.append(getattr(current, attr, None))
-        pending.extend(
-            arg
-            for arg in getattr(current, "args", ())
-            if isinstance(arg, BaseException)
-        )
-    return False
-
-
-#: Backend attributes that are the live client and what guards it: left out
-#: of a pickled or copied backend, which builds its own on first use.
-_LIVE = frozenset({"_client", "_client_lock", "__dict__", "__weakref__"})
-
-
-def lazy_client(backend, build):
-    """`backend._client`, made by `build()` the first time under
-    `backend._client_lock` so that threads racing for it build one."""
-    client = backend._client
-    if client is None:
-        with backend._client_lock:
-            client = backend._client
-            if client is None:
-                client = backend._client = build()
-    return client
-
-
-def backend_state(backend) -> dict:
-    """What a pickled or copied backend keeps: its slots and `__dict__`,
-    without the client it built and the lock that guarded the build."""
-    state = {}
-    for cls in type(backend).__mro__:
-        slots = getattr(cls, "__slots__", ())
-        for name in (slots,) if isinstance(slots, str) else slots:
-            if name not in _LIVE and hasattr(backend, name):
-                state[name] = getattr(backend, name)
-    state.update(
-        (name, value)
-        for name, value in getattr(backend, "__dict__", {}).items()
-        if name not in _LIVE
-    )
-    return state
-
-
-def restore_backend(backend, state: dict) -> None:
-    """The inverse of `backend_state()`: a backend with no client yet."""
-    for name, value in state.items():
-        setattr(backend, name, value)
-    backend._client = None
-    backend._client_lock = _threading.Lock()
+#: What a path text keeps unescaped when it is spelled as a URI.
+_SAFE_KEY = "!$&'()*+,;=:@/"
 
 
 def digest_hex(encoded: str) -> str:
     """The hex digest of `encoded`, the base64 text a store reports one in."""
     return _base64.b64decode(encoded).hex()
-
-
-def changed_error(path) -> OSError:
-    """The error for a stream whose object was replaced while it was being
-    read: a read is one version of the object, and what follows the change is
-    another's. `ESTALE` where the platform has it, else `EIO`."""
-    return OSError(
-        getattr(_errno, "ESTALE", _errno.EIO),
-        "the object changed while it was being read",
-        str(path),
-    )
-
-
-def unreachable_keys(
-    prefix: str, entries: "_ty.Iterable[tuple[str, int]]"
-) -> "list[str]":
-    """The keys among `entries` (`(key, size)` pairs, a flat listing of
-    `prefix`) that a walk of the directory `prefix` never visits.
-
-    `prefix` is `"dir/"`, or `""` for a bucket or container root. A key is
-    reached when every name below the prefix is one path component, no
-    directory on the way is also an object (the object wins and its subtree is
-    not listed), and a key ending in `/` is an empty marker rather than data.
-    The prefix's own marker (`prefix` itself) is reached.
-    """
-    entries = list(entries)
-    keys = {key for key, _size in entries}
-    unreachable = []
-    for key, size in entries:
-        rest = key[len(prefix) :]
-        if not rest:
-            continue
-        *directories, leaf = rest.split("/")
-        marker = leaf == ""
-        if not all(_providers.is_safe_child_name(name) for name in directories) or (
-            not marker and not _providers.is_safe_child_name(leaf)
-        ):
-            unreachable.append(key)
-        elif marker and size:
-            unreachable.append(key)
-        elif any(
-            prefix + "/".join(directories[:depth]) in keys
-            for depth in range(1, len(directories) + 1)
-        ):
-            unreachable.append(key)
-    return unreachable
-
-
-def refusal(path, action: str, keys: "list[str]") -> OSError:
-    """The error for `action` ("copy" or "remove") on a prefix that holds
-    `keys` a directory walk cannot reach; nothing has been changed."""
-    shown = ", ".join(repr(key) for key in keys[:5])
-    more = f" and {len(keys) - 5} more" if len(keys) > 5 else ""
-    return OSError(
-        _errno.EINVAL,
-        f"cannot {action} a prefix holding keys a listing does not show "
-        f"({shown}{more}); nothing was changed",
-        str(path),
-    )
 
 
 @_contextlib.contextmanager
@@ -217,192 +47,40 @@ def checked_copy(path, recursive: bool):
         _state.copying = False
 
 
-READ_CHUNK = 4 * 1024**2
-"""Bytes of an object that one ranged request of a streamed read asks for."""
-
-SPOOL_SIZE = 4 * 1024**2
-"""Bytes a write stream keeps in memory before spilling to a temp file, and
-the largest object a store uploads in one request."""
-
-
-class RangeReader(_io.RawIOBase):
-    """Reads an object as it is asked for, in ranged requests of `chunk` bytes,
-    so a read holds one chunk and not the object, and the stream can seek.
-
-    `fetch(start, length)` returns the bytes of the object from `start`, at
-    most `length`, and nothing at or past its end; it raises the `OSError` a
-    failed request means. `size()` is the object's size, asked only by
-    `seek(..., SEEK_END)`. `first` is the first chunk, already fetched."""
-
-    def __init__(self, fetch, size, first=b"", chunk=None):
-        super().__init__()
-        chunk = chunk or READ_CHUNK
-        self._fetch, self._size_of, self._chunk_size = fetch, size, chunk
-        self._start, self._pos = 0, 0
-        self._view = memoryview(first)
-        # A first chunk that falls short is the whole object.
-        self._size = len(first) if len(first) < chunk else None
-
-    def readable(self):
-        return True
-
-    def seekable(self):
-        return True
-
-    def tell(self):
-        self._check_open()
-        return self._pos
-
-    def seek(self, offset, whence=_io.SEEK_SET):
-        self._check_open()
-        if whence == _io.SEEK_SET:
-            pos = offset
-        elif whence == _io.SEEK_CUR:
-            pos = self._pos + offset
-        elif whence == _io.SEEK_END:
-            if self._size is None:
-                self._size = self._size_of()
-            pos = self._size + offset
-        else:
-            raise ValueError(f"invalid whence ({whence}, should be 0, 1 or 2)")
-        if pos < 0:
-            raise ValueError(f"negative seek value {pos}")
-        self._pos = pos
-        return pos
-
-    def readinto(self, buffer):
-        self._check_open()
-        if not len(buffer):
-            return 0
-        if not self._start <= self._pos < self._start + len(self._view):
-            if self._size is not None and self._pos >= self._size:
-                return 0
-            # The chunk that is done with goes before the next one arrives.
-            self._view = memoryview(b"")
-            data = self._fetch(self._pos, self._chunk_size)
-            self._start, self._view = self._pos, memoryview(data)
-            if len(data) < self._chunk_size:
-                self._size = self._pos + len(data)
-            if not data:
-                return 0
-        at = self._pos - self._start
-        count = min(len(buffer), len(self._view) - at)
-        buffer[:count] = self._view[at : at + count]
-        self._pos += count
-        return count
-
-    def _check_open(self):
-        if self.closed:
-            raise ValueError("I/O operation on closed file.")
-
-    def close(self):
-        self._view = memoryview(b"")
-        super().close()
+def check_place(kind: str, value, donor, owner: str) -> str:
+    """The name of the bucket or container (`kind`) that the constructor of
+    `owner` was given as `value`, else the one of the path `donor` it is
+    joined from. `TypeError` when there is none or it is not a string,
+    `ValueError` when it is empty or holds a `/`."""
+    if value is None:
+        if donor is None:
+            raise TypeError(f"{owner} needs {kind}= (or a segment that is an {owner})")
+        return donor._place
+    if not isinstance(value, str):
+        raise TypeError(f"{kind}= must be a str, not {type(value).__name__!r}")
+    if not value or "/" in value:
+        raise ValueError(f"{kind}= must be a name with no '/' in it, not {value!r}")
+    return value
 
 
-class SpoolUploadStream(_providers.DiscardOnError, _io.BufferedIOBase):
-    """The write stream of a store that uploads an object from a file: it
-    spools the writes (in memory up to `SPOOL_SIZE`, then a temp file) and
-    uploads them on close() with `path._upload_file(file, size, exclusive=)`.
-
-    `exclusive` (`open("x")`) makes the upload a conditional create. With
-    `initial` (`open("r+")`) the spool starts with the object's content at
-    position 0 and is uploaded only if it was modified."""
-
-    #: Bytes kept in memory before the spool moves to a temp file.
-    spool_size = SPOOL_SIZE
-    _dropped = False
-
-    def __init__(self, path, exclusive=False, initial=None):
-        super().__init__()
-        self._path = path
-        self._exclusive = exclusive
-        self._file = _tempfile.SpooledTemporaryFile(max_size=self.spool_size)
-        self._dirty = initial is None
-        if initial is not None:
-            while True:
-                chunk = initial.read(_io.DEFAULT_BUFFER_SIZE)
-                if not chunk:
-                    break
-                self._file.write(chunk)
-            self._file.seek(0)
-
-    def readable(self):
-        return True
-
-    def writable(self):
-        return True
-
-    def seekable(self):
-        return True
-
-    def _check_open(self):
-        if self.closed:
-            raise ValueError("I/O operation on closed file.")
-
-    def write(self, data):
-        self._check_open()
-        self._dirty = True
-        return self._file.write(data)
-
-    def read(self, size=-1):
-        self._check_open()
-        return self._file.read(size)
-
-    def read1(self, size=-1):
-        return self.read(size)
-
-    def seek(self, offset, whence=_io.SEEK_SET):
-        self._check_open()
-        self._file.seek(offset, whence)
-        return self._file.tell()
-
-    def tell(self):
-        self._check_open()
-        return self._file.tell()
-
-    def truncate(self, size=None):
-        self._check_open()
-        self._dirty = True
-        if size is None:
-            size = self._file.tell()
-        return self._file.truncate(size)
-
-    def discard(self):
-        """Drop the spool: `close()` uploads nothing. `open()` calls it when
-        the `with` block over the stream raised."""
-        self._dropped = True
-        self._file.close()
-
-    def close(self):
-        if self.closed:
-            return
-        try:
-            if self._dirty and not self._dropped:
-                self._upload()
-        finally:
-            # Closed even when the upload fails, so `IOBase.__del__` does not
-            # retry it (over newer content) at garbage collection.
-            try:
-                self._file.close()
-            finally:
-                super().close()
-
-    def _upload(self):
-        body = self._file
-        body.seek(0, _io.SEEK_END)
-        size = body.tell()
-        body.seek(0)
-        self._path._upload_file(body, size, exclusive=self._exclusive)
+def rebuild_path(cls, segments, keywords):
+    """Unpickles a path: `cls(**keywords)` with the names it had."""
+    path = cls(**keywords)
+    path._segments = segments
+    return path
 
 
-class ObjectStorePath(_UriPath):
-    """The algorithms `s3:`, `gs:` and `az:` share: a key namespace with no
-    directories, where a directory is any prefix `key/` that has keys under it
-    and `mkdir()` writes an empty `key/` marker. A store supplies the calls
-    that differ -- one SDK request each, errors already translated to
-    `OSError` (see `transport_error()`) -- and gets `stat()`, `rm()`,
+class ObjectStorePath(TreePath):
+    """The algorithms `S3Path`, `GSPath` and `AZPath` share. A store supplies
+    the calls that differ -- one SDK request each, errors already translated
+    to `OSError` (see `transport_error()`) -- and gets `stat()`, `rm()`,
     `unlink()`, `rmdir()`, `rename()`, `copy()` and the rest from here.
+
+    A path holds the names of a key below its bucket or container, joined and
+    parsed as `parse_names()` says, and the backend that reaches the store.
+    Two paths are equal when they are of one class, name one bucket or
+    container and spell one key; a path built from another keeps its place and
+    its backend.
 
     Primitives a subclass defines:
 
@@ -422,9 +100,12 @@ class ObjectStorePath(_UriPath):
       no object: the digests of the whole content the store keeps.
     - `_copy_object(target, size)` -> bool: the store's own copy call, this
       object onto `target`'s key; False when the store does not implement it.
+    - `_uri_root()` -> the text before the key in `as_uri()`; `_keywords()` ->
+      the constructor keywords that name this path's place;
+      `_default_keywords()` -> those that make its default backend.
     """
 
-    __slots__ = ()
+    __slots__ = ("_backend", "_place", "_hint")
 
     #: What the store calls its top level, for the refusals to remove it.
     _TOP = "bucket"
@@ -433,6 +114,158 @@ class ObjectStorePath(_UriPath):
     #: Exceptions `rm(recursive=True)` offers to `ignore_error` when listing a
     #: prefix fails (a missing bucket is not one).
     _LISTING_ERRORS: "tuple[type[BaseException], ...]" = (OSError,)
+
+    if _ty.TYPE_CHECKING:
+        _segments: "tuple[str, ...]"
+
+    @staticmethod
+    def _parse(path: str) -> "tuple[str, ...]":
+        return parse_names(path)
+
+    @classmethod
+    def _join(cls, segments):
+        # The slash that ends a piece separates it from the next one, as in
+        # pathlib: `"a/"` joined with `"b"` is `a/b`.
+        path = ""
+        donor = None
+        family = cls._family()
+        for segment in segments:
+            if isinstance(segment, family):
+                text = segment.as_posix()
+                if donor is None:
+                    donor = segment
+            else:
+                text = "/".join(cls._text_of(segment))
+            if text.startswith("/") or not path:
+                path = text
+            elif text:
+                path = f"{path[:-1] if path.endswith('/') else path}/{text}"
+        return path, donor
+
+    @staticmethod
+    def _text_of(segment) -> "tuple[str, ...]":
+        if isinstance(segment, Path):
+            raise NotImplementedError()
+        if isinstance(segment, Pathname):
+            return tuple(segment.segments)
+        if isinstance(segment, str):
+            return (segment,)
+        raise TypeError(
+            "argument should be a str or a Pathname, " f"not {type(segment).__name__!r}"
+        )
+
+    def _initialize(self, text: str, place: str, backend) -> None:
+        self._segments = self._parse(text)
+        self._place = place
+        self._backend = backend
+        self._hint = None
+
+    def _derived(self, segments: "tuple[str, ...]"):
+        """A path of this class, place and backend with the names `segments`."""
+        path = object.__new__(type(self))
+        path._segments = segments
+        path._place = self._place
+        path._backend = self._backend
+        path._hint = None
+        return path
+
+    def _rebuild(self, text: str):
+        return self._derived(split_names(text))
+
+    def with_segments(self, *segments: str):
+        return type(self)("/".join(segments), **self._keywords(), backend=self._backend)
+
+    def _keywords(self) -> dict:
+        """The constructor keywords that name this path's place."""
+        raise NotImplementedError
+
+    def _uri_root(self) -> str:
+        raise NotImplementedError
+
+    def is_local(self) -> bool:
+        """Whether the store is this machine: never. A bucket is not a host
+        name, so nothing is resolved; `PathSyncer(quick_check=True)` treats
+        both sides of a sync as non-local."""
+        return False
+
+    @property
+    def backend(self):
+        """The backend that reaches the store for this path."""
+        return self._backend
+
+    @property
+    def key(self) -> str:
+        """The object key this path names: its names joined by `/`, with no
+        leading `/`."""
+        return "/".join(self._segments).lstrip("/")
+
+    def _identity(self) -> tuple:
+        return (self._place, self.key)
+
+    def __eq__(self, other: object):
+        if type(self) is not type(other):
+            return NotImplemented
+        return self._identity() == other._identity()
+
+    def __hash__(self) -> int:
+        return hash((type(self), self._identity()))
+
+    def _order_key(self):
+        return self._identity()
+
+    def as_uri(self) -> str:
+        key = self.key
+        text = _urlparse.quote(key, safe=_SAFE_KEY, errors="surrogateescape")
+        return f"{self._uri_root()}/{text}" + ("/" if key.endswith("/") else "")
+
+    def __str__(self) -> str:
+        return self.as_uri()
+
+    def __reduce__(self):
+        # The place and the names; a backend travels only when it says it can
+        # (its options carry credentials), else the receiving process builds
+        # the default one.
+        keywords = self._keywords()
+        if getattr(self._backend, "picklable", False):
+            keywords["backend"] = self._backend
+        else:
+            keywords.update(self._default_keywords())
+        return rebuild_path, (type(self), self._segments, keywords)
+
+    def _default_keywords(self) -> dict:
+        """The constructor keywords that make the default backend of this
+        path's store, for a path that is pickled without its own backend."""
+        return {}
+
+    def _same_filesystem(self, other: "ObjectStorePath") -> bool:
+        # One bucket or container reached by one backend: a client is the
+        # credentials, so another backend may see another store.
+        return self._place == other._place and self._backend is other._backend
+
+    def _pop_stat_hint(self) -> "FileStat | None":
+        """The stat that the listing of the parent attached to this child,
+        once; the next call asks the store."""
+        hint, self._hint = self._hint, None
+        return hint
+
+    def _make_child_relpath(self, name: str, stat_hint=None, **kwargs):
+        """The child called exactly `name`, with the stat its listing gave."""
+        segments = self._segments
+        if segments == ("", ""):
+            names = ("", name)
+        else:
+            names = (*segments, name)
+        child = self._derived(names)
+        child._hint = stat_hint
+        return child
+
+    def iterdir(self):
+        for name, listed in self._scandir():
+            yield self._make_child_relpath(name, stat_hint=listed)
+
+    def _key_path(self, key: str) -> "ObjectStorePath":
+        """The path of the object `key` in this path's bucket or container."""
+        return self._derived(("", *key.split("/")) if key else ("", ""))
 
     def _stat_root(self) -> FileStat:
         raise NotImplementedError
@@ -476,14 +309,6 @@ class ObjectStorePath(_UriPath):
 
     def _copy_object(self, target: "ObjectStorePath", size: int) -> bool:
         raise NotImplementedError
-
-    def _rename_dest(self, target) -> "ObjectStorePath":
-        """The path `rename(target)` produces."""
-        return self.with_path(target.path)
-
-    def _key_path(self, key: str) -> "ObjectStorePath":
-        """The path of the object `key` in this path's bucket."""
-        return self.with_path(f"/{key}")
 
     def stat(self, *, follow_symlinks=True):
         hint = self._pop_stat_hint()
@@ -546,10 +371,6 @@ class ObjectStorePath(_UriPath):
             return self._has_prefix(key)
         except PermissionError:
             return False
-
-    def _listdir(self):
-        for name, _stat in self._scandir():
-            yield name
 
     def _mkdir(self, mode):
         # stat(), not exists(): a failed probe must not read as "missing".
@@ -715,17 +536,15 @@ class ObjectStorePath(_UriPath):
     def _store_copy_possible(self, target) -> bool:
         """Whether one request of the store can copy this object onto
         `target`, from what the two paths say without asking: the same class,
-        on one store, reached by one client (one supplied backend, or each
-        path's own default)."""
+        reached by one backend (a bucket may be another)."""
         return (
             type(target) is type(self)
             and bool(target.key)
-            and self._same_filesystem(target)
-            and self._supplied_backend() is target._supplied_backend()
+            and self._backend is target._backend
         )
 
     def _copy_in_store(
-        self, target, *, overwrite, follow_symlinks, recursive, progress
+        self, target, *, overwrite, follow_symlinks, recursive, progress, hint=None
     ) -> bool:
         """Copy this object onto `target` with the store's own copy call, after
         the checks `Path.copy()` makes before it writes, in the same order: the
@@ -738,8 +557,11 @@ class ObjectStorePath(_UriPath):
         call, or the source is the root of a recursive copy, which may be
         either and which `Path.copy()` asks about once, with what `move()`
         already knows. An object has no permission bits, so
-        `preserve_metadata` has nothing to carry over."""
-        hint = self._stat_hint
+        `preserve_metadata` has nothing to carry over.
+
+        `hint` is the stat a listing gave for this path, when the caller holds
+        one that this path does not."""
+        hint = self._hint if hint is None else hint
         if (hint is None and recursive) or (
             hint is not None and not _stat.S_ISREG(hint.st_mode)
         ):
@@ -751,7 +573,7 @@ class ObjectStorePath(_UriPath):
         if not _stat.S_ISREG(src_stat.st_mode):
             return False
         # The same object under two spellings of its key is one file too.
-        if self._same_location(target) and self.key == target.key:
+        if self._same_filesystem(target) and self.key == target.key:
             raise OSError(
                 _errno.EINVAL, "Source and target are the same file", str(target)
             )
@@ -774,16 +596,21 @@ class ObjectStorePath(_UriPath):
         return True
 
     def rename(self, target):
-        target = self._rename_target(target)
-        dest = self._rename_dest(target)
-        dest_key = dest.key
+        # A plain str target is a literal sibling name; a path of another
+        # bucket, another backend or another class cannot be renamed onto, and
+        # `move()` copies instead.
+        if isinstance(target, str):
+            target = self.parent / target
+        elif type(target) is not type(self) or not self._same_filesystem(target):
+            raise NotImplementedError("rename() onto another bucket or backend")
+        dest_key = target.key
         if dest_key == self.key:
             # Copying onto itself and then deleting the source loses the
             # object; a name that is not there is not renamed. pathlib
             # returns the new path.
             if not self._has_object(self.key):
                 self._stat_prefix()
-            return dest
+            return target
         source = self._rename_source(self.key)
         if source is None:
             # No object at the key: a prefix directory (FileNotFoundError
@@ -793,5 +620,5 @@ class ObjectStorePath(_UriPath):
             raise NotImplementedError(f"rename() of the prefix directory {self}")
         if self._holds_keys(dest_key):
             raise IsADirectoryError(_errno.EISDIR, "Is a directory", str(target))
-        self._rename_copy(source, dest, dest_key)
-        return dest
+        self._rename_copy(source, target, dest_key)
+        return target

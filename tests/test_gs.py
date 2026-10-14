@@ -1,47 +1,64 @@
+"""`GSPath` and the `gs:` URI path through the real `google-cloud-storage` client
+against the in-process fake of the Google Cloud Storage JSON API.
+
+Every test that takes `gs_server` runs once per `flavor`: on the `GSPath` of a
+bucket and on the `GSURIPath` of the same URL."""
+
+from __future__ import annotations
+
+import os
+import warnings
+
 import pytest
 
 import objstore_fakes
+from pathlib_next.testing import PathContract
+from store_support import make_path
 
+# Imported here, with the SDK's import-time warnings ignored by `importorskip`,
+# so that no later test is the first to import it.
 pytest.importorskip("google.cloud.storage")
+with warnings.catch_warnings():
+    # `google-crc32c` warns on import where it has no compiled extension, and
+    # the fake server's first import of it would run under the test's filters.
+    warnings.simplefilter("ignore")
+    try:
+        import google_crc32c  # noqa: F401
+    except ImportError:
+        pass
 
-from pathlib_next.uri.schemes.gs import GsPath, GsBackend
-from pathlib_next.uri import UriPath
+from objpath import GSBackend, GSPath, _gs, _reader  # noqa: E402
+from objpath.exceptions import ObjectChangedError, UnreachableKeysError  # noqa: E402
 
 
-@pytest.fixture
-def gs_server(gcs_api_server, monkeypatch):
-    """The fake GCS server through the real SDK. `GsBackend` no longer turns
-    `api_endpoint` into a process-wide `STORAGE_EMULATOR_HOST`, so a custom
-    endpoint authenticates unless told not to:
-    `use_auth_w_custom_endpoint=False` is the SDK's own no-auth switch."""
-    monkeypatch.delenv("STORAGE_EMULATOR_HOST", raising=False)
-    base_url, bucket_name = gcs_api_server
-    backend = GsBackend(
-        client_options={"api_endpoint": base_url},
-        use_auth_w_custom_endpoint=False,
-    )
-    yield GsPath(f"gs://{bucket_name}", backend=backend), backend
-    # The backend must not have redirected the rest of the process.
-    import os
-
+@pytest.fixture(autouse=True)
+def _backend_leaves_the_environment_alone():
+    """A backend passes `api_endpoint` to the client as it is: it never turns
+    it into a process-wide `STORAGE_EMULATOR_HOST`."""
+    yield
     assert "STORAGE_EMULATOR_HOST" not in os.environ
 
 
-def test_gs_path_registration():
-    """Test that gs: scheme resolves to GsPath."""
-    path = UriPath("gs://bucket/key/path", findclass=True)
-    assert isinstance(path, GsPath)
+@pytest.fixture
+def gs_backend(gcs_api_server):
+    """A backend that reaches the fake, and the fake's state."""
+    base_url, _bucket = gcs_api_server
+    backend = GSBackend(
+        client_options={"api_endpoint": base_url},
+        use_auth_w_custom_endpoint=False,
+    )
+    yield backend
+    backend.close()
 
 
 def test_gs_path_components(gs_server):
-    """Test that GsPath components are parsed correctly."""
     path, _ = gs_server
-    assert path.bucket_name == "test-bucket"
+    assert path.bucket == "test-bucket"
     assert path.key == ""
 
 
 def test_gs_stat_root(gs_server):
-    """Root always exists and is a directory."""
+    """The root of an existing bucket is a directory."""
     path, _ = gs_server
     stat = path.stat()
     assert stat.is_dir()
@@ -55,7 +72,6 @@ def test_gs_list_bucket_root(gs_server):
 
 
 def test_gs_read_existing_file(gs_server, fixture_tree):
-    """Read an existing file from the bucket."""
     path, backend = gs_server
     file_content = (fixture_tree / "a.txt").read_bytes()
     file_path = path / "a.txt"
@@ -64,7 +80,6 @@ def test_gs_read_existing_file(gs_server, fixture_tree):
 
 
 def test_gs_write_new_file(gs_server):
-    """Write a new file to the bucket."""
     path, backend = gs_server
     test_path = path / "new_file.txt"
     test_path.write_bytes(b"test content")
@@ -82,7 +97,6 @@ def test_gs_mkdir(gs_server):
 
 
 def test_gs_delete_file(gs_server):
-    """Delete a file."""
     path, backend = gs_server
     test_path = path / "to_delete.txt"
     test_path.write_bytes(b"delete me")
@@ -92,7 +106,6 @@ def test_gs_delete_file(gs_server):
 
 
 def test_gs_open_modes(gs_server):
-    """Test open() with different modes."""
     path, backend = gs_server
     test_path = path / "mode_test.txt"
 
@@ -133,12 +146,12 @@ def test_gs_prefix_with_a_hidden_subtree_is_not_copied_moved_or_removed(gs_serve
     path, _ = gs_server
     base = _object_that_is_also_a_prefix(path)
     target = MemPath("/copied")
-    with pytest.raises(OSError, match="nothing was changed"):
+    with pytest.raises(UnreachableKeysError, match="nothing was changed"):
         base.copy(target, recursive=True)
     assert not target.exists()
-    with pytest.raises(OSError, match="nothing was changed"):
+    with pytest.raises(UnreachableKeysError, match="nothing was changed"):
         base.move(path / "moved")
-    with pytest.raises(OSError, match="nothing was changed"):
+    with pytest.raises(UnreachableKeysError, match="nothing was changed"):
         base.rm(recursive=True)
     assert (base / "logs" / "2026.txt").read_bytes() == b"child"
     assert (base / "d" / "x").read_bytes() == b"x"
@@ -159,29 +172,31 @@ def test_gs_rmdir_of_the_bucket_root_is_refused(gs_server):
     assert (path / "a.txt").exists()
 
 
-def _closed_port():
-    import socket
+@pytest.fixture
+def unreachable(flavor, unused_tcp_port):
+    """Builds the path of an object in a bucket whose endpoint is a loopback
+    port nobody listens on; `options` are the backend's `timeout=`/`retry=`."""
+    backends = []
 
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+    def build(**options):
+        backend = GSBackend(
+            client_options={"api_endpoint": f"http://127.0.0.1:{unused_tcp_port}"},
+            use_auth_w_custom_endpoint=False,
+            project="p",
+            **options,
+        )
+        backends.append(backend)
+        return make_path(flavor, "gs://bucket/blob.txt", backend=backend)
+
+    yield build
+    for backend in backends:
+        backend.close()
 
 
-def _unreachable(monkeypatch, **options):
-    monkeypatch.delenv("STORAGE_EMULATOR_HOST", raising=False)
-    backend = GsBackend(
-        client_options={"api_endpoint": f"http://127.0.0.1:{_closed_port()}"},
-        use_auth_w_custom_endpoint=False,
-        project="p",
-        **options,
-    )
-    return GsPath("gs://bucket/blob.txt", backend=backend)
-
-
-def test_gs_nothing_listening_is_a_connection_error_without_retries(monkeypatch):
+def test_gs_nothing_listening_is_a_connection_error_without_retries(unreachable):
     # A refused loopback connection takes about two seconds to be reported on
     # Windows, so the timeout must be longer than that.
-    path = _unreachable(monkeypatch, timeout=10, retry=None)
+    path = unreachable(timeout=10, retry=None)
     with pytest.raises(ConnectionError) as info:
         path.stat()
     assert not isinstance(info.value, TimeoutError)
@@ -190,10 +205,10 @@ def test_gs_nothing_listening_is_a_connection_error_without_retries(monkeypatch)
     assert path.exists() is False
 
 
-def test_gs_a_retry_that_runs_out_of_time_is_still_a_connection_error(monkeypatch):
+def test_gs_a_retry_that_runs_out_of_time_is_still_a_connection_error(unreachable):
     from google.cloud.storage.retry import DEFAULT_RETRY
 
-    path = _unreachable(monkeypatch, timeout=10, retry=DEFAULT_RETRY.with_deadline(1))
+    path = unreachable(timeout=10, retry=DEFAULT_RETRY.with_deadline(1))
     with pytest.raises(ConnectionError) as info:
         path.stat()
     assert info.value.__cause__ is None
@@ -222,8 +237,10 @@ def test_gs_a_listing_that_spans_pages_shows_every_entry_once(
     del state.requests[:]
     names = sorted(child.name for child in (path / "paged").iterdir())
     assert names == ["d0", "d1", "d2", "f0", "f1", "f2"]
-    assert len(_list_requests(state)) >= 3
-    assert len({target for target in _list_requests(state)}) >= 3
+    # Six entries, two to a page: one request per page, each asking for a
+    # different one.
+    assert len(_list_requests(state)) == 3
+    assert len(set(_list_requests(state))) == 3
 
 
 def test_gs_removing_a_prefix_lists_every_page(gs_server, gcs_api_server):
@@ -269,7 +286,7 @@ def test_gs_a_refused_key_of_a_batch_is_offered_once_with_its_own_path(
         ignore_error=lambda error, where: offered.append((type(error), str(where)))
         or True,
     )
-    assert offered == [(PermissionError, f"{path}/bulk/f3")]
+    assert offered == [(PermissionError, str(path / "bulk" / "f3"))]
     assert [name for name in state.objects if name.startswith("bulk/")] == ["bulk/f3"]
 
 
@@ -507,24 +524,37 @@ def test_gs_a_stream_seeks_without_reading_what_it_skips(gs_server, gcs_api_serv
 
 
 def test_gs_an_exclusive_upload_does_not_replace_an_existing_object(
-    gs_server, gcs_api_server, monkeypatch
+    gs_backend, gcs_api_server, monkeypatch
 ):
     import io
 
-    from pathlib_next.uri.schemes import _objstore as store
-
-    path, _ = gs_server
     state = gcs_api_server.state
+    path = GSPath("", bucket="test-bucket", backend=gs_backend)
     before = state.objects["a.txt"]
     with pytest.raises(FileExistsError):
         (path / "a.txt")._upload(b"new", exclusive=True)
     # Above the single-request size the upload is a resumable one.
-    monkeypatch.setattr(store, "SPOOL_SIZE", 8)
+    monkeypatch.setattr(_gs, "SPOOL_SIZE", 8)
     with pytest.raises(FileExistsError):
         (path / "a.txt")._upload_file(io.BytesIO(b"123456789"), 9, exclusive=True)
     assert state.objects["a.txt"] == before
     (path / "fresh.txt")._upload_file(io.BytesIO(b"123456789"), 9, exclusive=True)
     assert state.objects["fresh.txt"] == b"123456789"
+
+
+@pytest.mark.parametrize("size", [3, 9], ids=["one-request", "resumable"])
+def test_gs_an_exclusive_stream_does_not_replace_an_object_created_meanwhile(
+    gs_server, gcs_api_server, monkeypatch, size
+):
+    path, _ = gs_server
+    state = gcs_api_server.state
+    monkeypatch.setattr(_gs, "SPOOL_SIZE", 8)
+    stream = (path / "race.bin").open("xb")
+    stream.write(b"1" * size)
+    state.objects["race.bin"] = b"first"
+    with pytest.raises(FileExistsError):
+        stream.close()
+    assert state.objects["race.bin"] == b"first"
 
 
 # --- a read is one version of the object ------------------------------------
@@ -554,9 +584,9 @@ def _change_on_second_read(state, name, change):
 
 @pytest.fixture
 def small_chunks(monkeypatch):
-    from pathlib_next.uri.schemes import _objstore as store
-
-    monkeypatch.setattr(store, "READ_CHUNK", 16)
+    """A ranged read asks for 16 bytes at a time: the first request is made by
+    the path, the following ones by the reader."""
+    monkeypatch.setattr(_reader, "READ_CHUNK", 16)
 
 
 def test_gs_a_read_across_an_overwrite_raises_and_returns_no_mixed_bytes(
@@ -575,10 +605,11 @@ def test_gs_a_read_across_an_overwrite_raises_and_returns_no_mixed_bytes(
             stream.read(16)
     assert got == [OLD[:16]]
     error = info.value
+    assert isinstance(error, ObjectChangedError)
     assert not isinstance(error, FileNotFoundError)
     assert error.errno == _stale_errno()
     assert "changed while it was being read" in error.strerror
-    assert error.filename == f"{path}/pinned.bin"
+    assert error.filename == str(path / "pinned.bin")
     assert error.__cause__ is None
     assert state.objects["pinned.bin"] == NEW
 
@@ -636,3 +667,18 @@ def test_gs_every_request_after_the_first_names_the_generation(
     with (path / "pinned.bin").open("rb") as stream:
         assert stream.read() == NEW
     assert state.reads[-1][2] == str(state.objects.version("pinned.bin")) != generation
+
+
+# --- the contract every Path meets, against the in-process GCS fake -------------
+
+
+class TestGSContract(PathContract):
+    # Directories are key prefixes and objects are written whole.
+    enforces_directory_hierarchy = False
+    supports_append = False
+    supports_question_mark_names = True
+    supports_utime = False
+
+    @pytest.fixture
+    def root(self, gs_server):
+        return gs_server[0]
