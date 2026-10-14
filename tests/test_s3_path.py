@@ -363,6 +363,23 @@ def test_the_parts_of_a_key_are_its_names():
     assert path.parent.parent.parent.key == ""
 
 
+@pytest.mark.parametrize(
+    "text, segments",
+    [
+        ("", ()),
+        ("/", ("", "")),
+        ("a/b", ("a", "b")),
+        ("/a/b", ("", "a", "b")),
+        ("///a", ("", "a")),
+        ("a//b", ("a", "", "b")),
+        ("a/./b", ("a", "b")),
+        ("dir//", ("dir", "")),
+    ],
+)
+def test_the_segments_of_a_path_are_its_names_rooted_or_not(text, segments):
+    assert S3Path(text, bucket="bkt").segments == segments
+
+
 # --- repr and str ---------------------------------------------------------------
 
 
