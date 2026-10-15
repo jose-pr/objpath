@@ -75,7 +75,7 @@ def test_the_extras_are_one_sdk_per_store_the_schemes_and_their_union(project):
         "s3": {"boto3"},
         "gs": {"google-cloud-storage"},
         "az": {"azure-storage-blob", "azure-identity"},
-        "uri": {"uripath"},
+        "uri": {"pathapi-uri"},
         "all": {"objpath"},
     }
     assert extras["all"] == ["objpath[s3,gs,az,uri]"]
