@@ -46,7 +46,7 @@ az = [
     "azure-identity>=1.0,<2",
 ]
 # The s3:, gs: and az: schemes of uripath. `import objpath` never imports uripath.
-uri = ["uripath>=0.1.0,<0.2"]
+uri = ["pathapi-uri>=0.1.0,<0.2"]
 all = ["objpath[s3,gs,az,uri]"]
 dev = [
     'build',

@@ -92,7 +92,7 @@ jobs:
         shell: bash
         run: |
           if [ -n "$CORE_REF" ]; then python -m pip install "pathapi @ git+https://github.com/jose-pr/pathapi@${CORE_REF}"; fi
-          if [ -n "$URIPATH_REF" ]; then python -m pip install "uripath @ git+https://github.com/jose-pr/uripath@${URIPATH_REF}"; fi
+          if [ -n "$URIPATH_REF" ]; then python -m pip install "pathapi-uri @ git+https://github.com/jose-pr/uripath@${URIPATH_REF}"; fi
       - name: Install the package with boto3, uripath and its test tools
         # A missing library skips its tests (pytest.importorskip) instead of
         # running them. The Google Cloud Storage and Azure SDKs are heavy and
@@ -124,7 +124,7 @@ jobs:
         shell: bash
         run: |
           if [ -n "$CORE_REF" ]; then python -m pip install "pathapi @ git+https://github.com/jose-pr/pathapi@${CORE_REF}"; fi
-          if [ -n "$URIPATH_REF" ]; then python -m pip install "uripath @ git+https://github.com/jose-pr/uripath@${URIPATH_REF}"; fi
+          if [ -n "$URIPATH_REF" ]; then python -m pip install "pathapi-uri @ git+https://github.com/jose-pr/uripath@${URIPATH_REF}"; fi
       - name: Install the package with every extra, gs and az included
         run: python -m pip install -e ".[dev,all]"
       - name: Run tests
@@ -263,7 +263,7 @@ jobs:
         shell: bash
         run: |
           if [ -n "$CORE_REF" ]; then python -m pip install "pathapi @ git+https://github.com/jose-pr/pathapi@${CORE_REF}"; fi
-          if [ -n "$URIPATH_REF" ]; then python -m pip install "uripath @ git+https://github.com/jose-pr/uripath@${URIPATH_REF}"; fi
+          if [ -n "$URIPATH_REF" ]; then python -m pip install "pathapi-uri @ git+https://github.com/jose-pr/uripath@${URIPATH_REF}"; fi
       - name: Install at the floors
         run: python -m pip install -c floors.txt -e ".[dev,all]"
       - name: Run tests
@@ -324,7 +324,7 @@ jobs:
         shell: bash
         run: |
           if [ -n "$CORE_REF" ]; then python -m pip install "pathapi @ git+https://github.com/jose-pr/pathapi@${CORE_REF}"; fi
-          if [ -n "$URIPATH_REF" ]; then python -m pip install "uripath @ git+https://github.com/jose-pr/uripath@${URIPATH_REF}"; fi
+          if [ -n "$URIPATH_REF" ]; then python -m pip install "pathapi-uri @ git+https://github.com/jose-pr/uripath@${URIPATH_REF}"; fi
       - name: Install benchmark dependencies
         run: python -m pip install -e ".[dev,all]"
       - name: Run benchmark suite
