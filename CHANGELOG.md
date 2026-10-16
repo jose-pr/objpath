@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`rm()` and `copy()` take `max_workers`**, the keyword of `pathapi`'s recursive
+  `rm()` and `copy()` (a class runs serially unless it declares `_threadsafe`,
+  which these classes do not). A streamed copy passes it on; the batch delete and the
+  store's own copy call ignore it. Nothing changes for a call that does not give it,
+  and it works with the `pathapi` release that lacks it as long as it is not given.
+
 ## [0.1.0] - 2026-10-14
 
 The first release of `objpath`: the Amazon S3, Google Cloud Storage and Azure Blob

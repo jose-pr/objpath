@@ -434,3 +434,30 @@ mutant(
     "tests/test_spool_unclosed.py::test_an_unclosed_stream_that_was_not_modified_is_collected_silently",
     "a spooled stream with nothing to upload warns when collected",
 )
+
+mutant(
+    "objpath-store-rm-always-passes-max-workers",
+    "_storepath.py",
+    '                # Only when given: pathapi 0.1.1 has no such keyword.\n                **({} if max_workers is None else {"max_workers": max_workers}),\n            )\n\n        def on_error(',
+    "                max_workers=max_workers,\n            )\n\n        def on_error(",
+    "tests/test_az_fake.py::test_the_generic_calls_get_max_workers_only_when_it_is_given",
+    "rm() hands pathapi a max_workers it was not given, which a release without the keyword refuses",
+)
+
+mutant(
+    "objpath-store-copy-always-passes-max-workers",
+    "_storepath.py",
+    '                # Only when given: pathapi 0.1.1 has no such keyword.\n                **({} if max_workers is None else {"max_workers": max_workers}),\n            )\n\n    def _store_copy_possible',
+    "                max_workers=max_workers,\n            )\n\n    def _store_copy_possible",
+    "tests/test_az_fake.py::test_the_generic_calls_get_max_workers_only_when_it_is_given",
+    "copy() hands pathapi a max_workers it was not given, which a release without the keyword refuses",
+)
+
+mutant(
+    "objpath-uri-copy-always-passes-max-workers",
+    "_uri_store.py",
+    '                # Only when given: pathapi 0.1.1 has no such keyword.\n                **({} if max_workers is None else {"max_workers": max_workers}),\n',
+    "                max_workers=max_workers,\n",
+    "tests/test_az_fake.py::test_the_generic_calls_get_max_workers_only_when_it_is_given",
+    "the URI copy() hands pathapi a max_workers it was not given",
+)

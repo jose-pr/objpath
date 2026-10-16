@@ -160,6 +160,9 @@ Reading and writing:
   with that key's path, one error per key. `rm(recursive=True)` of a missing bucket is
   a missing path (`missing_ok`, `ignore_error` decide). There are no symlinks or
   bindings: `follow_symlinks=` and `follow_binds=` are checked and decide nothing.
+  `rm()` and `copy()` take `max_workers=None` (`pathapi`'s keyword, passed on to the
+  generic walks only when given; the batch delete and the store's copy call ignore it,
+  and a path never declares `_threadsafe`).
 - `checksum(algorithm="md5")` (`NativeChecksum`) is the digest the store keeps, read with
   one request and no byte of the content. S3: the plain MD5 that the ETag is for an object
   one request wrote and KMS or a customer key does not encrypt, or the stored full-object

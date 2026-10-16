@@ -1422,3 +1422,70 @@ def test_r_plus_reads_its_initial_content_as_one_version(az, monkeypatch):
         az("az://account/container/big.bin", backend).open("r+b")
     assert info.value.errno == _stale_errno()
     assert container.objects["big.bin"] == NEW and container.uploads == []
+
+
+# --- max_workers ---------------------------------------------------------------------
+
+
+def _generic_owner(path, name):
+    """The class whose `name` the override of `path`'s class reaches with `super()`."""
+    # A URI path hands `rm()` to its core path, whose `super()` is the generic one.
+    if name == "rm":
+        path = getattr(path, "_core_path", path)
+    owners = [base for base in type(path).__mro__ if name in vars(base)]
+    return owners[1]
+
+
+@pytest.mark.parametrize("name", ["rm", "copy"])
+def test_rm_and_copy_have_the_parameters_of_the_path_ones_and_max_workers(az, name):
+    import inspect
+
+    from pathapi import Path
+
+    expected = inspect.signature(getattr(Path, name)).parameters
+    actual = inspect.signature(getattr(type(az("az://account/c/k")), name)).parameters
+    assert [n for n in actual if n != "max_workers"] == [
+        n for n in expected if n != "max_workers"
+    ]
+    assert actual["max_workers"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert actual["max_workers"].default is None
+    for pname, parameter in expected.items():
+        assert actual[pname].kind == parameter.kind, pname
+        assert actual[pname].default == parameter.default, pname
+
+
+def test_the_batch_delete_and_the_service_copy_ignore_max_workers(az):
+    backend, container = _container_with(**{"dir/a.txt": b"a", "dir/b.txt": b"b"})
+
+    az("az://account/container/dir/a.txt", backend).copy(
+        az("az://account/container/c.txt", backend), max_workers=4
+    )
+    az("az://account/container/dir", backend).rm(recursive=True, max_workers=4)
+
+    assert container.copies == [("dir/a.txt", "c.txt")]
+    assert sorted(container.objects) == ["c.txt"]
+
+
+@pytest.mark.parametrize("name", ["rm", "copy"])
+@pytest.mark.parametrize("workers", [None, 4])
+def test_the_generic_calls_get_max_workers_only_when_it_is_given(
+    az, monkeypatch, name, workers
+):
+    seen = []
+    source = az("az://account/container/a.txt")
+    monkeypatch.setattr(
+        _generic_owner(source, name),
+        name,
+        lambda self, *args, **kw: seen.append(kw),
+    )
+    extra = {} if workers is None else {"max_workers": workers}
+
+    if name == "rm":
+        source.rm(**extra)
+    else:
+        # Another backend: the streamed copy, which is the generic one.
+        source.copy(az("az://account/container/b.txt"), **extra)
+
+    assert [kw.get("max_workers", "absent") for kw in seen] == [
+        "absent" if workers is None else workers
+    ]

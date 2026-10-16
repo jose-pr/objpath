@@ -371,7 +371,10 @@ class ObjectStorePath(TreePath):
         *,
         follow_symlinks=False,
         follow_binds=False,
+        max_workers=None,
     ):
+        """Remove as `Path.rm()` does. `max_workers` is `Path.rm()`'s and is
+        ignored: a recursive removal is the store's batch delete."""
         # An object store holds no symlinks or bindings: the policies are
         # checked and have nothing to decide.
         check_follow("follow_symlinks", follow_symlinks)
@@ -383,6 +386,8 @@ class ObjectStorePath(TreePath):
                 ignore_error=ignore_error,
                 follow_symlinks=follow_symlinks,
                 follow_binds=follow_binds,
+                # Only when given: pathapi 0.1.1 has no such keyword.
+                **({} if max_workers is None else {"max_workers": max_workers}),
             )
 
         def on_error(error, path=None):
@@ -461,7 +466,11 @@ class ObjectStorePath(TreePath):
         ignore_error=None,
         progress=None,
         on_error=None,
+        max_workers=None,
     ):
+        """Copy as `Path.copy()` does, with the store's own copy call for one
+        object of the same store. `max_workers` is `Path.copy()`'s and applies to
+        the streamed copy only; the store's copy call ignores it."""
         # A prefix is copied by walking it; one that holds keys the walk
         # cannot reach is refused up front rather than copied incompletely.
         # That refusal is not a per-child error: `on_error` is never asked.
@@ -486,6 +495,8 @@ class ObjectStorePath(TreePath):
                 ignore_error=ignore_error,
                 progress=progress,
                 **({} if on_error is None else {"on_error": on_error}),
+                # Only when given: pathapi 0.1.1 has no such keyword.
+                **({} if max_workers is None else {"max_workers": max_workers}),
             )
 
     def _store_copy_possible(self, target) -> bool:
