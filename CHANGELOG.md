@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-17
+
 ### Added
 
 - **`rm()` and `copy()` take `max_workers`**, the keyword of `pathapi`'s recursive
@@ -117,5 +119,6 @@ name `pathlib_next`); the old names below are the ones before the move.
   and emits a `ResourceWarning`; `pathlib-next` closed it, and so uploaded it. What to do:
   close the file, or use `with`.
 
-[Unreleased]: https://github.com/jose-pr/objpath/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/jose-pr/objpath/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/jose-pr/objpath/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/jose-pr/objpath/releases/tag/v0.1.0
